@@ -1,5 +1,7 @@
 import * as dotenv from 'dotenv';
-import { app, BrowserWindow, BrowserView } from 'electron';
+import * as fs from 'fs';
+import * as path from 'path';
+import { app, BrowserWindow } from 'electron';
 
 dotenv.config();
 
@@ -15,6 +17,7 @@ const createWindow = () => {
 
     webPreferences: {
       nodeIntegration: true,
+      contextIsolation: false,
     },
   });
 
@@ -22,7 +25,31 @@ const createWindow = () => {
 
   // Open the DevTools.
   process.env.NODE_ENV === 'dev' && mainWindow.webContents.openDevTools();
+
+  // 注入 TTS 听书脚本（页面加载完成后）
+  mainWindow.webContents.on('did-finish-load', () => {
+    injectTTS(mainWindow);
+  });
 };
+
+/**
+ * 将编译后的 TTS 脚本注入到微信读书页面
+ */
+function injectTTS(win: BrowserWindow): void {
+  try {
+    const injectPath = path.join(__dirname.replace('tsout', 'src'), 'ttsInject.ts');
+    if (fs.existsSync(injectPath)) {
+      const code = fs.readFileSync(injectPath, 'utf-8');
+      win.webContents.executeJavaScript(code)
+        .then(() => console.log('[Main] TTS 脚本注入成功'))
+        .catch((err) => console.error('[Main] TTS 注入失败:', err));
+    } else {
+      console.warn('[Main] TTS 注入脚本未找到，跳过注入:', injectPath);
+    }
+  } catch (err) {
+    console.error('[Main] TTS 注入异常:', err);
+  }
+}
 
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
@@ -45,6 +72,3 @@ app.on('window-all-closed', () => {
     app.quit();
   }
 });
-
-// In this file you can include the rest of your app"s specific main process
-// code. You can also put them in separate files and require them here.
