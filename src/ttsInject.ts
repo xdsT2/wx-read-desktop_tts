@@ -1,26 +1,22 @@
 /**
- * TTS 注入脚本 —— 内联版本（无模块依赖）
- * 此文件会被 main.ts 读取并通过 executeJavaScript 注入到微信读书页面
- * 所有逻辑内联，不使用 import/export，确保在页面上下文中直接运行
+ * TTS 注入脚本 —— 微信读书听书 v4（彻底重做）
  *
- * v3 改进：
- * - debug 日志 + volume=1 + onstart 回调
- * - 健壮 initVoices（onvoiceschanged + fallback timeout + 3s 兜底提示）
- * - "从这里开始朗读" 选区浮动按钮
- * - 本地语音不可用时禁用播放 + 友好提示
- * - TextChunker 用 matchAll 保留分隔符切分
- * - PlaybackStore 不再存全文，改用 textHash + textLength 验证
+ * 核心改进：
+ * 1. 文本提取：多策略 + 可见区域优先 + 兜底 body 全文
+ * 2. 原生选区工具栏注入"朗读"按钮（不再用浮动按钮）
+ * 3. 自动断点续播（无需确认弹窗）
+ * 4. 播放器 UI 优化：状态清晰、错误友好
  */
 
 (function () {
   'use strict';
 
   var DEBUG = true;
-  function log() { if (DEBUG) { var args = Array.prototype.slice.call(arguments); args.unshift('[TTS Engine]'); console.log.apply(console, args); } }
-  function warn() { if (DEBUG) { var args = Array.prototype.slice.call(arguments); args.unshift('[TTS Engine]'); console.warn.apply(console, args); } }
+  function log() { if (DEBUG) { var args = Array.prototype.slice.call(arguments); args.unshift('[TTS]'); console.log.apply(console, args); } }
+  function warn() { if (DEBUG) { var args = Array.prototype.slice.call(arguments); args.unshift('[TTS]'); console.warn.apply(console, args); } }
 
   // ============================================================
-  // 1. Web Speech API 引擎（增加 debug 日志 + volume=1 + onstart）
+  // 1. Web Speech API 引擎
   // ============================================================
   function WebTTSEngine() {
     this.utterance = null;
@@ -37,14 +33,14 @@
 
   WebTTSEngine.checkAvailability = function () {
     if (!('speechSynthesis' in window)) {
-      return { supported: false, hasChineseVoice: false, voices: [], message: '当前浏览器不支持 Web Speech API。请考虑升级浏览器或使用云端 TTS 服务。' };
+      return { supported: false, hasChineseVoice: false, voices: [], message: '浏览器不支持语音合成' };
     }
     var allVoices = speechSynthesis.getVoices();
     var zhVoices = allVoices.filter(function (v) { return v.lang.startsWith('zh') || v.lang.includes('CN'); });
     if (zhVoices.length === 0) {
-      return { supported: true, hasChineseVoice: false, voices: [], message: 'Web Speech API 可用，但未检测到中文语音。请在系统设置中安装中文语音包，或切换到云端 TTS。' };
+      return { supported: true, hasChineseVoice: false, voices: [], message: '未检测到中文语音' };
     }
-    return { supported: true, hasChineseVoice: true, voices: zhVoices, message: 'Web Speech API 可用，检测到 ' + zhVoices.length + ' 个中文语音。' };
+    return { supported: true, hasChineseVoice: true, voices: zhVoices, message: 'OK' };
   };
 
   WebTTSEngine.getChineseVoices = function () {
@@ -58,17 +54,7 @@
   };
 
   WebTTSEngine.prototype.speak = function (text) {
-    if (!('speechSynthesis' in window)) {
-      var msg = '浏览器不支持 Web Speech API，无法朗读。请切换到云端 TTS 服务。';
-      console.error('[TTS] ' + msg);
-      if (this.onError) this.onError(0, msg);
-      return;
-    }
-    var zhVoices = WebTTSEngine.getChineseVoices();
-    if (zhVoices.length === 0 && !this._voice) {
-      warn('未检测到中文语音，将使用默认语音');
-      if (this.onError) this.onError(0, '未检测到中文语音，朗读效果可能不佳。建议安装中文语音包或切换云端 TTS。');
-    }
+    if (!('speechSynthesis' in window)) { if (this.onError) this.onError(0, '不支持语音合成'); return; }
     this.cancel();
     this.chunks = this.splitIntoChunks(text);
     this.currentChunkIndex = 0;
@@ -84,16 +70,16 @@
     this.currentChunkIndex = chunkIndex;
     this._isPlaying = true;
     this._isPaused = false;
-    log('从第', chunkIndex, '段开始朗读，共', chunks.length, '段');
+    log('从第', chunkIndex + 1, '段开始，共', chunks.length, '段');
     this.speakCurrentChunk();
   };
 
   WebTTSEngine.prototype.pause = function () {
-    if (speechSynthesis.speaking && !speechSynthesis.paused) { speechSynthesis.pause(); this._isPaused = true; log('已暂停'); }
+    if (speechSynthesis.speaking && !speechSynthesis.paused) { speechSynthesis.pause(); this._isPaused = true; }
   };
 
   WebTTSEngine.prototype.resume = function () {
-    if (speechSynthesis.paused) { speechSynthesis.resume(); this._isPaused = false; log('已恢复'); }
+    if (speechSynthesis.paused) { speechSynthesis.resume(); this._isPaused = false; }
   };
 
   WebTTSEngine.prototype.cancel = function () {
@@ -117,7 +103,7 @@
     var self = this;
     if (this.currentChunkIndex >= this.chunks.length) {
       this._isPlaying = false;
-      log('全部片段朗读完毕');
+      log('朗读完毕');
       if (this.onAllEnd) this.onAllEnd();
       return;
     }
@@ -126,32 +112,26 @@
 
     this.utterance = new SpeechSynthesisUtterance(text);
     this.utterance.rate = this._rate;
-    this.utterance.volume = 1; // 确保音量最大
+    this.utterance.volume = 1;
     this.utterance.lang = 'zh-CN';
     if (this._voice) this.utterance.voice = this._voice;
 
-    log('朗读第 ' + (this.currentChunkIndex + 1) + '/' + this.chunks.length + ' 段: "' + text.slice(0, 30) + '..."');
+    log('[' + (this.currentChunkIndex + 1) + '/' + this.chunks.length + '] ', text.slice(0, 40));
 
-    this.utterance.onstart = function () {
-      log('第 ' + self.currentChunkIndex + ' 段 onstart 触发');
-    };
-
+    this.utterance.onstart = function () {};
     this.utterance.onend = function () {
-      log('第 ' + self.currentChunkIndex + ' 段 onend 触发');
       self.currentChunkIndex++;
       if (self.onChunkEnd) self.onChunkEnd(self.currentChunkIndex);
       if (self._isPlaying && !self._isPaused) self.speakCurrentChunk();
     };
-
     this.utterance.onerror = function (e) {
-      warn('第 ' + self.currentChunkIndex + ' 段 onerror: ' + e.error);
+      warn('onerror:', e.error);
       if (self.onError) self.onError(self.currentChunkIndex, e.error);
       if (e.error !== 'canceled' && e.error !== 'interrupted') {
         self.currentChunkIndex++;
         if (self._isPlaying && !self._isPaused) self.speakCurrentChunk();
       }
     };
-
     speechSynthesis.speak(this.utterance);
   };
 
@@ -177,823 +157,689 @@
   };
 
   // ============================================================
-  // 2. 文本提取器
+  // 2. 文本提取器 —— 多策略，确保能提取到内容
   // ============================================================
   var TextExtractor = {
+    /** 提取正文，返回 { text, chapterTitle } 或 null */
     extract: function () {
       var text = TextExtractor.extractText();
-      if (!text || text.trim().length < 10) { console.warn('[TTS] 未在页面中提取到有效文本'); return null; }
-      return { text: text.trim(), chapterTitle: TextExtractor.extractChapterTitle(), chapterIndex: TextExtractor.extractChapterInfo().index, totalChapters: TextExtractor.extractChapterInfo().total };
+      if (!text || text.trim().length < 10) {
+        warn('文本提取失败，长度:', text ? text.length : 0);
+        return null;
+      }
+      return {
+        text: text.trim(),
+        chapterTitle: TextExtractor.extractChapterTitle()
+      };
     },
+
+    /** 核心提取：多策略依次尝试 */
     extractText: function () {
-      // 策略0（最精确）：在正文容器内只提取段落级元素
-      var contentEl = TextExtractor.findContentElement();
-      if (contentEl) {
-        var paragraphs = contentEl.querySelectorAll('p');
-        if (paragraphs.length > 0) {
-          var texts = [];
-          for (var pi = 0; pi < paragraphs.length; pi++) {
-            var p = paragraphs[pi];
-            var ptext = (p.textContent || '').trim();
-            if (ptext.length < 2) continue;
-            var rect = p.getBoundingClientRect();
-            if (rect.width === 0 && rect.height === 0) continue;
-            texts.push(ptext);
-          }
-          if (texts.length > 0) {
-            var combined = texts.join('\n');
-            var cleaned = TextExtractor.cleanText(combined);
-            if (cleaned.length > 20) return cleaned;
-          }
+      // 策略1：直接收集页面中所有可见的段落文本（最可靠）
+      var result = TextExtractor.extractVisibleParagraphs();
+      if (result && result.length > 20) return result;
+
+      // 策略2：已知微信读书选择器
+      var knownSelectors = [
+        '.readerContent', '.render-text-container',
+        '[class*="readerText"]', '[class*="render_text"]',
+        '.text-content', 'article', '.content',
+        '#j_content', 'main', '.reader_content',
+        '[class*="chapter"]', '[class*="readerChapter"]'
+      ];
+      for (var i = 0; i < knownSelectors.length; i++) {
+        var el = document.querySelector(knownSelectors[i]);
+        if (el) {
+          var t = TextExtractor.cleanText(el.textContent || '');
+          if (t.length > 20) { log('提取成功(选择器):', knownSelectors[i], '长度:', t.length); return t; }
         }
-        // 如果没找到 p，用容器的 textContent 但排除非正文子元素
-        var filtered = TextExtractor.extractFilteredContent(contentEl);
-        if (filtered.length > 20) return filtered;
       }
 
-      // 策略1：微信读书渲染层常用选择器
-      var selectors = ['.readerContent', '.render-text-container', '[class*="readerText"]', '[class*="render_text"]', '.text-content', 'article', '.content', '#j_content', 'main'];
-      for (var i = 0; i < selectors.length; i++) {
-        var el = document.querySelector(selectors[i]);
-        if (el) { var t = TextExtractor.cleanText(el.textContent || ''); if (t.length > 20) return t; }
+      // 策略3：找中文最多的容器
+      var best = TextExtractor.findBestContainer();
+      if (best && best.text.length > 20) { log('提取成功(最佳容器), 长度:', best.text.length); return best.text; }
+
+      // 策略4：兜底 — 收集 body 中所有含中文的文本节点
+      var fallback = TextExtractor.extractFromBody();
+      if (fallback.length > 20) { log('提取成功(body兜底), 长度:', fallback.length); return fallback; }
+
+      warn('所有提取策略均失败');
+      return '';
+    },
+
+    /** 策略1：收集可见区域内的段落文本 */
+    extractVisibleParagraphs: function () {
+      var texts = [];
+
+      // 先尝试 p 标签
+      var ps = document.querySelectorAll('p');
+      for (var i = 0; i < ps.length; i++) {
+        var p = ps[i];
+        var t = (p.textContent || '').trim();
+        if (t.length < 4) continue;
+        // 跳过明显非正文的元素
+        var cls = (p.className || '').toLowerCase();
+        if (cls.indexOf('toolbar') >= 0 || cls.indexOf('menu') >= 0 ||
+            cls.indexOf('nav') >= 0 || cls.indexOf('footer') >= 0 ||
+            cls.indexOf('header') >= 0 || cls.indexOf('sidebar') >= 0) continue;
+        var rect = p.getBoundingClientRect();
+        // 跳过不可见元素但保留即将可见的（高度为0可能是还没渲染）
+        if (rect.width === 0 && rect.height === 0 && t.length < 10) continue;
+        texts.push(t);
       }
-      return TextExtractor.scanForContent();
-    },
-    /** 从容器中提取正文，排除注释、脚注、侧栏等非正文子元素 */
-    extractFilteredContent: function (container) {
-      var clone = container.cloneNode(true);
-      var excludeSelectors = ['nav', 'header', 'footer', 'aside', '[role="navigation"]', '[role="complementary"]', '.footnote', '.annotation', '.comment', '.note', '.sidebar', '.toolbar', '.menu', '.breadcrumb', 'script', 'style', 'noscript', '[class*="foot"]', '[class*="note"]', '[class*="comment"]', '[class*="sidebar"]', '[class*="toolbar"]', '[class*="menu"]', '[class*="header"]', '[class*="footer"]'];
-      for (var i = 0; i < excludeSelectors.length; i++) {
-        var els = clone.querySelectorAll(excludeSelectors[i]);
-        for (var j = 0; j < els.length; j++) { els[j].remove(); }
+
+      if (texts.length >= 3) {
+        log('提取到', texts.length, '个段落');
+        return texts.join('\n');
       }
-      return TextExtractor.cleanText(clone.textContent || '');
+
+      // 如果 p 太少，尝试 div/span 中含中文较多的元素
+      var allEls = document.querySelectorAll('div, section, span');
+      var candidates = [];
+      for (var j = 0; j < allEls.length; j++) {
+        var el = allEls[j];
+        var et = (el.textContent || '').trim();
+        var chineseCount = (et.match(/[\u4e00-\u9fa5]/g) || []).length;
+        if (chineseCount > 30 && et.length < 50000) {
+          candidates.push({ el: el, text: et, chinese: chineseCount });
+        }
+      }
+      // 取中文最多的前几个合并
+      candidates.sort(function (a, b) { return b.chinese - a.chinese; });
+      if (candidates.length > 0) {
+        return candidates[0].text;
+      }
+
+      return texts.join('\n');
     },
-    cleanText: function (raw) {
-      return raw.replace(/\s+/g, ' ').replace(/[^\u4e00-\u9fa5a-zA-Z0-9，。！？、；：""''（）\n\r\s\.\,\!\?\;\:\(\)\-\—]/g, '').trim();
-    },
-    scanForContent: function () {
-      var bestEl = null, maxLength = 0;
-      var skipSelectors = ['nav', 'header', 'footer', 'aside', '[role="navigation"]', 'script', 'style', '.toolbar', '.sidebar'];
+
+    /** 策略3：找中文密度最高的容器 */
+    findBestContainer: function () {
+      var skip = ['script', 'style', 'noscript', 'nav', 'header', 'footer', 'aside'];
       var candidates = document.querySelectorAll('div, section, article, main');
+      var best = null, bestScore = 0;
       for (var i = 0; i < candidates.length; i++) {
         var el = candidates[i];
-        var shouldSkip = false;
-        for (var j = 0; j < skipSelectors.length; j++) { if (el.matches(skipSelectors[j]) || el.closest(skipSelectors[j])) { shouldSkip = true; break; } }
-        if (shouldSkip) continue;
-        var text = (el.textContent || '').trim();
-        var chineseCount = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
-        if (chineseCount > maxLength && chineseCount > 50) { maxLength = chineseCount; bestEl = el; }
+        var skipEl = false;
+        for (var j = 0; j < skip.length; j++) {
+          if (el.tagName.toLowerCase() === skip[j] || el.closest(skip[j])) { skipEl = true; break; }
+        }
+        if (skipEl) continue;
+        var t = (el.textContent || '').trim();
+        var chinese = (t.match(/[\u4e00-\u9fa5]/g) || []).length;
+        var ratio = chinese / (t.length || 1);
+        // 中文占比高 + 中文数量多 = 好候选
+        var score = chinese * ratio;
+        if (score > bestScore && chinese > 50) { bestScore = score; best = { el: el, text: TextExtractor.cleanText(t) }; }
       }
-      return bestEl ? TextExtractor.cleanText(bestEl.textContent || '') : '';
+      return best;
     },
-    /** 找到正文容器的 DOM 元素（与 extractText 使用相同的选择器优先级） */
+
+    /** 策略4：body 兜底 */
+    extractFromBody: function () {
+      var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+      var texts = [];
+      while (walker.nextNode()) {
+        var node = walker.currentNode;
+        var t = node.textContent.trim();
+        if (t.length < 2) continue;
+        var parent = node.parentElement;
+        if (!parent) continue;
+        var tag = parent.tagName.toLowerCase();
+        if (tag === 'script' || tag === 'style' || tag === 'noscript') continue;
+        // 只要包含中文就收录
+        if (/[\u4e00-\u9fa5]/.test(t)) texts.push(t);
+      }
+      return texts.join('\n');
+    },
+
+    cleanText: function (raw) {
+      return raw
+        .replace(/\s+/g, ' ')
+        .replace(/[^\u4e00-\u9fa5a-zA-Z0-9，。！？、；：""''（）\n\r\s\.\,\!\?\;\:\(\)\-\—\·]/g, '')
+        .trim();
+    },
+
+    extractChapterTitle: function () {
+      var sel = ['.chapter-title', '.chapter_title', '[class*="chapterTitle"]',
+        '.current-chapter h1', '.chapterInfo_title', 'h1.title', '.title',
+        '[class*="chapter"][class*="title"]'];
+      for (var i = 0; i < sel.length; i++) {
+        var el = document.querySelector(sel[i]);
+        if (el && el.textContent && el.textContent.trim()) return el.textContent.trim();
+      }
+      // 尝试从 URL 或页面标题获取
+      var title = document.title || '';
+      if (title && title !== '微信读书') return title.replace(/_.*$/, '');
+      return '当前章节';
+    },
+
+    /** 找到正文容器的 DOM 元素 */
     findContentElement: function () {
-      var selectors = ['.readerContent', '.render-text-container', '[class*="readerText"]', '[class*="render_text"]', '.text-content', 'article', '.content', '#j_content', 'main'];
+      var selectors = ['.readerContent', '.render-text-container', '[class*="readerText"]',
+        '[class*="render_text"]', '.text-content', 'article', '.content', 'main'];
       for (var i = 0; i < selectors.length; i++) {
         var el = document.querySelector(selectors[i]);
         if (el && (el.textContent || '').trim().length > 20) return el;
       }
-      // 兜底：用 scanForContent 的逻辑找最佳元素
-      var bestEl = null, maxLength = 0;
-      var skipSelectors = ['nav', 'header', 'footer', 'aside', '[role="navigation"]', 'script', 'style', '.toolbar', '.sidebar'];
-      var candidates = document.querySelectorAll('div, section, article, main');
-      for (var i = 0; i < candidates.length; i++) {
-        var el2 = candidates[i];
-        var shouldSkip = false;
-        for (var j = 0; j < skipSelectors.length; j++) { if (el2.matches(skipSelectors[j]) || el2.closest(skipSelectors[j])) { shouldSkip = true; break; } }
-        if (shouldSkip) continue;
-        var text = (el2.textContent || '').trim();
-        var chineseCount = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
-        if (chineseCount > maxLength && chineseCount > 50) { maxLength = chineseCount; bestEl = el2; }
-      }
-      return bestEl || null;
+      var best = TextExtractor.findBestContainer();
+      return best ? best.el : null;
     },
-    /** 计算当前选区在指定容器内的字符偏移（Range API），返回 -1 表示选区不在容器内 */
-    getSelectionOffsetInContainer: function (container) {
-      var sel = window.getSelection();
-      if (!sel || sel.rangeCount === 0) return -1;
-      var range = sel.getRangeAt(0);
-      if (!container.contains(range.startContainer)) return -1;
-      var preRange = document.createRange();
-      preRange.selectNodeContents(container);
-      preRange.setEnd(range.startContainer, range.startOffset);
-      return preRange.toString().length;
-    },
-    /** 找到当前可视区域中间的段落文本，映射到 chunkIndex，返回 0 表示无法定位 */
+
+    /** 找可视区域中心对应的 chunkIndex */
     findVisibleChunkIndex: function (fullText, chunks) {
       var contentEl = TextExtractor.findContentElement();
       if (!contentEl) return 0;
-      var viewportCenter = window.innerHeight / 2;
-      var paragraphs = contentEl.querySelectorAll('p, div.readerChapterContent, span, [class*="text"]');
-      var bestEl = null, bestDistance = Infinity;
-      for (var i = 0; i < paragraphs.length; i++) {
-        var p = paragraphs[i];
-        var rect = p.getBoundingClientRect();
-        if (rect.height === 0) continue;
-        var elCenter = rect.top + rect.height / 2;
-        var distance = Math.abs(elCenter - viewportCenter);
-        if (rect.top < window.innerHeight && rect.bottom > 0 && distance < bestDistance) {
-          bestDistance = distance; bestEl = p;
+      var centerY = window.innerHeight / 2;
+      var items = contentEl.querySelectorAll('p, div, span, [class*="text"], [class*="paragraph"]');
+      var bestEl = null, bestDist = Infinity;
+      for (var i = 0; i < items.length; i++) {
+        var r = items[i].getBoundingClientRect();
+        if (r.height === 0) continue;
+        var c = r.top + r.height / 2;
+        var d = Math.abs(c - centerY);
+        if (r.top < window.innerHeight && r.bottom > 0 && d < bestDist) {
+          bestDist = d; bestEl = items[i];
         }
       }
       if (!bestEl) return 0;
       var elText = TextExtractor.cleanText(bestEl.textContent || '');
       if (!elText || elText.length < 4) return 0;
-      var charIndex = fullText.indexOf(elText);
-      if (charIndex === -1 && elText.length > 20) charIndex = fullText.indexOf(elText.slice(0, 20));
-      if (charIndex === -1) return 0;
+      var idx = fullText.indexOf(elText);
+      if (idx === -1 && elText.length > 15) idx = fullText.indexOf(elText.slice(0, 15));
+      if (idx === -1) return 0;
       var offset = 0;
-      for (var i = 0; i < chunks.length; i++) {
-        if (charIndex >= offset && charIndex < offset + chunks[i].length) return i;
-        offset += chunks[i].length;
+      for (var j = 0; j < chunks.length; j++) {
+        if (idx >= offset && idx < offset + chunks[j].length) return j;
+        offset += chunks[j].length;
       }
       return 0;
-    },
-    extractChapterTitle: function () {
-      var selectors = ['.chapter-title', '.chapter_title', '[class*="chapterTitle"]', '.current-chapter h1', '.chapterInfo_title', 'h1.title', '.title'];
-      for (var i = 0; i < selectors.length; i++) { var el = document.querySelector(selectors[i]); if (el && el.textContent && el.textContent.trim()) return el.textContent.trim(); }
-      return '未知章节';
-    },
-    extractChapterInfo: function () {
-      try {
-        var activeItem = document.querySelector('[class*="chapter"][class*="active"], [class*="chapter_item"][class*="selected"]');
-        if (activeItem) { var siblings = activeItem.parentElement ? activeItem.parentElement.children : null; if (siblings) { var idx = Array.prototype.indexOf.call(siblings, activeItem); return { index: idx >= 0 ? idx : 0, total: siblings.length }; } }
-      } catch (e) { /* ignore */ }
-      return { index: 0, total: 1 };
     }
   };
 
   // ============================================================
-  // 3. 播放状态持久化（不存全文，用 hash 验证）
+  // 3. 持久化存储
   // ============================================================
   function simpleHash(str) {
-    var hash = 0;
-    for (var i = 0; i < str.length; i++) { var c = str.charCodeAt(i); hash = ((hash << 5) - hash) + c; hash = hash & hash; }
-    return (hash >>> 0).toString(16);
+    var h = 0;
+    for (var i = 0; i < str.length; i++) { var c = str.charCodeAt(i); h = ((h << 5) - h) + c; h = h & h; }
+    return (h >>> 0).toString(16);
   }
 
   var PlaybackStore = {
-    PREFIX: 'tts_playback_',
-    save: function (state, text) {
-      var existing = PlaybackStore.load(state.bookId);
-      var merged = {
-        bookId: state.bookId,
-        chapterTitle: state.chapterTitle || (existing ? existing.chapterTitle : ''),
-        chapterIndex: state.chapterIndex !== undefined ? state.chapterIndex : (existing ? existing.chapterIndex : 0),
-        chunkIndex: state.chunkIndex !== undefined ? state.chunkIndex : (existing ? existing.chunkIndex : 0),
-        textHash: text ? simpleHash(text) : (existing ? existing.textHash : ''),
-        textLength: text ? text.length : (existing ? existing.textLength : 0),
-        rate: state.rate !== undefined ? state.rate : (existing ? existing.rate : 1),
-        voiceName: state.voiceName !== undefined ? state.voiceName : (existing ? existing.voiceName : null),
-        timestamp: Date.now()
-      };
-      try { localStorage.setItem(PlaybackStore.PREFIX + state.bookId, JSON.stringify(merged)); }
-      catch (e) { console.warn('[TTS] 保存播放进度失败:', e); }
+    PREFIX: 'wxread_tts_',
+    save: function (bookId, state, text) {
+      try {
+        var data = {
+          bookId: bookId,
+          chapterTitle: state.chapterTitle || '',
+          chunkIndex: state.chunkIndex || 0,
+          totalChunks: state.totalChunks || 0,
+          textHash: text ? simpleHash(text) : '',
+          textLength: text ? text.length : 0,
+          rate: state.rate || 1,
+          voiceName: state.voiceName || null,
+          timestamp: Date.now()
+        };
+        localStorage.setItem(PlaybackStore.PREFIX + bookId, JSON.stringify(data));
+        log('进度已保存:', data.chunkIndex + '/' + data.totalChunks, data.chapterTitle);
+      } catch (e) { warn('保存失败:', e); }
     },
     load: function (bookId) {
-      try { var raw = localStorage.getItem(PlaybackStore.PREFIX + bookId); return raw ? JSON.parse(raw) : null; }
+      try { var r = localStorage.getItem(PlaybackStore.PREFIX + bookId); return r ? JSON.parse(r) : null; }
       catch (e) { return null; }
     },
-    matchesSavedState: function (bookId, currentText) {
-      var saved = PlaybackStore.load(bookId);
-      if (!saved) return false;
-      return saved.textHash === simpleHash(currentText) && saved.textLength === currentText.length;
+    clear: function (bookId) { try { localStorage.removeItem(PlaybackStore.PREFIX + bookId); } catch(e){} },
+    getLastBookId: function () {
+      try { return localStorage.getItem(PlaybackStore.PREFIX + '_lastBook') || ''; }
+      catch (e) { return ''; }
     },
-    clear: function (bookId) { localStorage.removeItem(PlaybackStore.PREFIX + bookId); }
+    setLastBookId: function (id) {
+      try { localStorage.setItem(PlaybackStore.PREFIX + '_lastBook', id); } catch(e){}
+    }
   };
 
-  var DEFAULT_SETTINGS = { rate: 1, voiceName: null, autoExtract: true, showFallbackHint: true };
-
   var SettingsStore = {
-    KEY: 'tts_settings',
-    save: function (partial) {
-      var current = SettingsStore.load();
-      var merged = Object.assign({}, current, partial);
-      try { localStorage.setItem(SettingsStore.KEY, JSON.stringify(merged)); }
-      catch (e) { console.warn('[TTS] 保存设置失败:', e); }
+    KEY: 'wxread_tts_settings',
+    DEFAULTS: { rate: 1, voiceName: null, autoResume: true },
+    save: function (p) {
+      try { var c = SettingsStore.load(); Object.assign(c, p); localStorage.setItem(SettingsStore.KEY, JSON.stringify(c)); }
+      catch (e) {}
     },
     load: function () {
-      try { var raw = localStorage.getItem(SettingsStore.KEY); return raw ? Object.assign({}, DEFAULT_SETTINGS, JSON.parse(raw)) : Object.assign({}, DEFAULT_SETTINGS); }
-      catch (e) { return Object.assign({}, DEFAULT_SETTINGS); }
+      try { var r = localStorage.getItem(SettingsStore.KEY); return r ? Object.assign({}, SettingsStore.DEFAULTS, JSON.parse(r)) : Object.assign({}, SettingsStore.DEFAULTS); }
+      catch (e) { return Object.assign({}, SettingsStore.DEFAULTS); }
     }
   };
 
   // ============================================================
-  // 4. 悬浮播放器 UI + "从这里开始朗读" 按钮
+  // 4. 播放器 UI
   // ============================================================
-  var PLAYER_CSS = '#wx-read-tts-player{position:fixed;bottom:20px;right:20px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;user-select:none;transition:opacity .3s ease,transform .3s ease}#wx-read-tts-player.tts-hidden{opacity:0;pointer-events:none;transform:translateY(20px)}#wx-read-tts-player .tts-bar{display:flex;align-items:center;gap:6px;background:rgba(30,30,34,.95);backdrop-filter:blur(12px);border-radius:14px;padding:8px 12px;box-shadow:0 4px 24px rgba(0,0,0,.4),0 0 1px rgba(255,255,255,.1);color:#e8e8e8;font-size:13px;min-width:320px}#wx-read-tts-player .tts-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:none;border-radius:50%;background:transparent;color:#ccc;cursor:pointer;transition:background .15s,color .15s,transform .1s;flex-shrink:0}#wx-read-tts-player .tts-btn:hover{background:rgba(255,255,255,.12);color:#fff}#wx-read-tts-player .tts-btn:active{transform:scale(.92)}#wx-read-tts-player .tts-btn.tts-play-btn{width:40px;height:40px;background:#1aad63;color:#fff}#wx-read-tts-player .tts-btn.tts-play-btn:hover{background:#1bc06d}#wx-read-tts-player .tts-chapter-info{flex:1;min-width:0;overflow:hidden}#wx-read-tts-player .tts-chapter-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:#aaa;margin-bottom:2px}#wx-read-tts-player .tts-progress-line{display:flex;align-items:center;gap:6px;font-size:11px;color:#888}#wx-read-tts-player .tts-progress-bar-bg{flex:1;height:3px;background:rgba(255,255,255,.15);border-radius:2px;overflow:hidden;cursor:pointer}#wx-read-tts-player .tts-progress-bar-fill{height:100%;background:#1aad63;border-radius:2px;transition:width .2s linear;width:0}#wx-read-tts-player .tts-rate-select{appearance:none;-webkit-appearance:none;background:rgba(255,255,255,.08);border:none;border-radius:6px;color:#ddd;font-size:12px;padding:4px 6px;cursor:pointer;outline:none;min-width:48px}#wx-read-tts-player .tts-rate-select option{background:#2a2a2e;color:#fff}#wx-read-tts-player .tts-divider{width:1px;height:20px;background:rgba(255,255,255,.15);flex-shrink:0}#wx-read-tts-player .tts-error-bar{display:none;background:rgba(180,60,60,.9);color:#ffe0e0;font-size:11px;padding:6px 12px;border-radius:0 0 14px 14px;margin-top:-4px;line-height:1.4}#wx-read-tts-player .tts-error-bar.tts-error-visible{display:block}#wx-read-tts-player .tts-error-bar .tts-error-close{float:right;cursor:pointer;margin-left:8px;font-weight:bold}#wx-read-tts-settings{position:fixed;bottom:90px;right:20px;z-index:2147483647;background:rgba(30,30,34,.97);backdrop-filter:blur(16px);border-radius:14px;padding:18px 20px;box-shadow:0 8px 32px rgba(0,0,0,.5);color:#e8e8e8;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;font-size:13px;min-width:280px;display:none;user-select:none}#wx-read-tts-settings.tts-visible{display:block}#wx-read-tts-settings .tts-setting-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}#wx-read-tts-settings .tts-setting-row:last-child{margin-bottom:0}#wx-read-tts-settings label{color:#aaa;font-size:12px}#wx-read-tts-settings select,#wx-read-tts-settings input[type=range]{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.1);border-radius:6px;color:#ddd;font-size:12px;padding:4px 8px;outline:none;cursor:pointer}#wx-read-tts-settings select option{background:#2a2a2e}#wx-read-tts-settings input[type=range]{-webkit-appearance:none;width:120px;padding:0;border:none;height:4px;border-radius:2px}#wx-read-tts-settings input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#1aad63;cursor:pointer;border:2px solid #fff}#wx-read-tts-settings .tts-set-title{font-weight:600;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.08);font-size:14px}#wx-read-tts-start-here{position:fixed;z-index:2147483646;background:#1aad63;color:#fff;border:none;border-radius:8px;padding:6px 14px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;cursor:pointer;box-shadow:0 2px 12px rgba(0,0,0,.3);display:none;user-select:none;white-space:nowrap;transition:opacity .2s,transform .2s}#wx-read-tts-start-here:hover{background:#1bc06d;transform:scale(1.04)}#wx-read-tts-start-here:active{transform:scale(.96)}';
+  var CSS = '' +
+    '#wxr-tts{position:fixed;bottom:16px;right:16px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;user-select:none}' +
+    '#wxr-tts .bar{display:flex;align-items:center;gap:6px;background:rgba(32,32,36,.94);backdrop-filter:blur(16px);border-radius:14px;padding:8px 12px;box-shadow:0 4px 24px rgba(0,0,0,.45);color:#eee;font-size:13px;min-width:300px}' +
+    '#wxr-tts .bar button{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;border:none;border-radius:50%;background:transparent;color:#bbb;cursor:pointer;font-size:15px;transition:all .15s;flex-shrink:0}' +
+    '#wxr-tts .bar button:hover{background:rgba(255,255,255,.12);color:#fff}' +
+    '#wxr-tts .bar button:active{transform:scale(.9)}' +
+    '#wxr-tts .bar button.play-btn{width:42px;height:42px;background:#1aad63;color:#fff;font-size:18px}' +
+    '#wxr-tts .bar button.play-btn:hover{background:#1bc06d}' +
+    '#wxr-tts .bar button.play-btn.playing{background:#e64340}' +
+    '#wxr-tts .info{flex:1;min-width:0}' +
+    '#wxr-tts .title{font-size:11px;color:#aaa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}' +
+    '#wxr-tts .progress{display:flex;align-items:center;gap:6px;font-size:11px;color:#888}' +
+    '#wxr-tts .pos{min-width:36px;text-align:right}' +
+    '#wxr-tts .pb-bg{flex:1;height:3px;background:rgba(255,255,255,.12);border-radius:2px;overflow:hidden;cursor:pointer}' +
+    '#wxr-tts .pb-fill{height:100%;background:#1aad63;border-radius:2px;transition:width .2s;width:0%}' +
+    '#wxr-tts .divider{width:1px;height:22px;background:rgba(255,255,255,.12)}' +
+    '#wxr-tts select.rate{appearance:none;-webkit-appearance:none;background:rgba(255,255,255,.08);border:none;border-radius:6px;color:#ccc;font-size:11px;padding:4px 6px;cursor:pointer;outline:none;min-width:46px}' +
+    '#wxr-tts select.rate option{background:#222;color:#fff}' +
+    '#wxr-tts .err{display:none;background:rgba(200,60,60,.92);color:#ffd;padding:6px 12px;border-radius:0 0 14px 14px;margin-top:-4px;font-size:11px;line-height:1.4}' +
+    '#wxr-tts .err.show{display:block}' +
+    '#wxr-tts .err .close{float:right;cursor:pointer;margin-left:8px;font-weight:bold;color:#faa}' +
+
+    /* 设置面板 */
+    '#wxr-tts-set{position:fixed;bottom:84px;right:16px;z-index:2147483647;background:rgba(32,32,36,.97);backdrop-filter:blur(20px);border-radius:14px;padding:16px 18px;box-shadow:0 8px 36px rgba(0,0,0,.55);color:#eee;font-family:inherit;font-size:13px;min-width:260px;display:none;user-select:none}' +
+    '#wxr-tts-set.show{display:block}' +
+    '#wxr-tts-set h3{margin:0 0 12px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.08);font-size:14px;font-weight:600}' +
+    '#wxr-tts-set .row{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}' +
+    '#wxr-tts-set .row:last-child{margin-bottom:0}' +
+    '#wxr-tts-set label{color:#aaa;font-size:12px}' +
+    '#wxr-tts-set select,#wxr-tts-set input[type=range]{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.1);border-radius:6px;color:#ddd;font-size:12px;padding:3px 6px;outline:none;cursor:pointer}' +
+    '#wxr-tts-set input[type=range]{width:110px;padding:0;border:none;height:4px}' +
+    '#wxr-tts-set input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#1aad63;cursor:pointer;border:2px solid #fff}' +
+
+    /* 原生工具栏注入按钮 */
+    '.wxr-tts-toolbar-btn{display:inline-flex;align-items:center;gap:3px;padding:4px 10px;margin-left:4px;border:none;border-radius:4px;background:rgba(26,173,99,.9);color:#fff;font-size:12px;cursor:pointer;font-family:inherit;white-space:nowrap;vertical-align:middle;transition:background .15s}' +
+    '.wxr-tts-toolbar-btn:hover{background:rgba(27,192,109,1)}' +
+    '.wxr-tts-toolbar-btn:active{transform:scale(.95)}';
 
   function createPlayerHTML() {
-    return '<div id="wx-read-tts-player" class="tts-hidden"><div class="tts-bar">' +
-      '<button class="tts-btn tts-prev-btn" title="上一段">⏮</button>' +
-      '<button class="tts-btn tts-play-btn" title="播放/暂停">▶</button>' +
-      '<button class="tts-btn tts-next-btn" title="下一段">⏭</button>' +
-      '<div class="tts-chapter-info"><div class="tts-chapter-title">点击开始朗读</div>' +
-      '<div class="tts-progress-line"><span class="tts-pos-text">0/0</span>' +
-      '<div class="tts-progress-bar-bg"><div class="tts-progress-bar-fill"></div></div></div></div>' +
-      '<div class="tts-divider"></div>' +
-      '<select class="tts-rate-select" title="语速"><option value="0.5">0.5x</option><option value="0.75">0.75x</option>' +
+    return '<div id="wxr-tts"><div class="bar">' +
+      '<button class="prev" title="上一段">⏮</button>' +
+      '<button class="play-btn" title="播放">▶</button>' +
+      '<button class="next" title="下一段">⏭</button>' +
+      '<div class="info"><div class="title">点击 ▶ 开始朗读</div>' +
+      '<div class="progress"><span class="pos">0/0</span><div class="pb-bg"><div class="pb-fill"></div></div></div></div>' +
+      '<div class="divider"></div>' +
+      '<select class="rate" title="语速"><option value="0.5">0.5x</option><option value="0.75">0.75x</option>' +
       '<option value="1" selected>1x</option><option value="1.25">1.25x</option>' +
       '<option value="1.5">1.5x</option><option value="2">2x</option></select>' +
-      '<button class="tts-btn tts-settings-btn" title="设置">⚙</button>' +
-      '<button class="tts-btn tts-close-btn" title="关闭">×</button></div>' +
-      '<div class="tts-error-bar"><span class="tts-error-close">×</span><span class="tts-error-msg"></span></div></div>' +
-      '<div id="wx-read-tts-settings"><div class="tts-set-title">TTS 朗读设置</div>' +
-      '<div class="tts-setting-row"><label>语音选择</label><select class="tts-voice-select"><option value="">加载中...</option></select></div>' +
-      '<div class="tts-setting-row"><label>朗读速度</label><input type="range" class="tts-rate-slider" min="0.25" max="3" step="0.25" value="1"><span class="tts-rate-value">1x</span></div>' +
-      '<div class="tts-setting-row"><label>自动提取文本</label><input type="checkbox" class="tts-auto-extract" checked></div>' +
-      '<div class="tts-setting-row"><label>断点续播</label><input type="checkbox" class="tts-resume-toggle" checked></div></div>';
+      '<button class="set-btn" title="设置">⚙</button>' +
+      '<button class="close-btn" title="关闭">×</button></div>' +
+      '<div class="err"><span class="close">×</span><span class="msg"></span></div></div>' +
+      '<div id="wxr-tts-set"><h3>朗读设置</h3>' +
+      '<div class="row"><label>语音</label><select class="voice-sel"><option value="">加载中...</option></select></div>' +
+      '<div class="row"><label>语速</label><input type="range" class="rate-slider" min="0.25" max="3" step="0.25" value="1"><span class="rate-val">1x</span></div>' +
+      '<div class="row"><label>自动续播</label><input type="checkbox" class="auto-resume" checked></div></div>';
   }
 
   // ============================================================
-  // 5. 主播放器（完整版：debug + startHere + 健壮 initVoices + 不可用提示）
+  // 5. 主播放器
   // ============================================================
   function TTSPlayer() {
     var self = this;
     this.engine = new WebTTSEngine();
     this.settings = SettingsStore.load();
-    this.currentContent = null;
-    this.currentChunks = [];
+    this.content = null;
+    this.chunks = [];
     this.bookId = '';
-    this._totalChunks = 0;
-    this._currentIndex = 0;
-    this._voicesLoaded = false;
+    this.totalChunks = 0;
+    this.currentIndex = 0;
 
     // 注入样式和 HTML
-    var styleEl = document.createElement('style');
-    styleEl.textContent = PLAYER_CSS;
-    document.head.appendChild(styleEl);
-    var wrapper = document.createElement('div');
-    wrapper.innerHTML = createPlayerHTML();
-    document.body.appendChild(wrapper);
+    var s = document.createElement('style');
+    s.textContent = CSS;
+    document.head.appendChild(s);
+    var w = document.createElement('div');
+    w.innerHTML = createPlayerHTML();
+    document.body.appendChild(w);
 
-    this.container = document.getElementById('wx-read-tts-player');
-    this.settingsPanel = document.getElementById('wx-read-tts-settings');
-
-    // 创建"从这里开始朗读"浮动按钮
-    this.startHereBtn = document.createElement('button');
-    this.startHereBtn.id = 'wx-read-tts-start-here';
-    this.startHereBtn.textContent = '从这里开始朗读';
-    document.body.appendChild(this.startHereBtn);
+    this.el = document.getElementById('wxr-tts');
+    this.setEl = document.getElementById('wxr-tts-set');
 
     this.engine._rate = this.settings.rate;
-
-    // 绑定引擎回调
     this.engine.setCallbacks({
-      onChunkEnd: function (idx) { self.onChunkEnd(idx); },
-      onAllEnd: function () { self.onAllEnd(); },
-      onError: function (chunkIdx, err) { self.onEngineError(chunkIdx, err); }
+      onChunkEnd: function (idx) { self.currentIndex = idx; self.updatePos(); self.saveProgress(); },
+      onAllEnd: function () { self.updatePlayBtn(false); self.currentIndex = 0; self.updatePos(); },
+      onError: function (idx, err) { if (err !== 'canceled' && err !== 'interrupted') self.showError(err); }
     });
 
-    // 初始化语音列表（健壮版）
     this.initVoices();
+    this.bindEvents();
+    this.checkAvail();
+    this.injectToolbarButton();
 
     // 显示播放器
-    this.container.classList.remove('tts-hidden');
     this.updateRateUI();
-
-    // 检测可用性
-    this.checkAvailability();
-
-    // ---- UI 事件绑定 ----
-    this.container.querySelector('.tts-play-btn').addEventListener('click', function () { self.togglePlay(); });
-    this.container.querySelector('.tts-prev-btn').addEventListener('click', function () { self.previous(); });
-    this.container.querySelector('.tts-next-btn').addEventListener('click', function () { self.next(); });
-    this.container.querySelector('.tts-close-btn').addEventListener('click', function () { self.close(); });
-    this.container.querySelector('.tts-settings-btn').addEventListener('click', function () { self.toggleSettings(); });
-    this.container.querySelector('.tts-error-close').addEventListener('click', function () { self.hideError(); });
-
-    this.container.querySelector('.tts-rate-select').addEventListener('change', function (e) { self.setRate(parseFloat(e.target.value)); });
-    this.settingsPanel.querySelector('.tts-rate-slider').addEventListener('input', function (e) { self.setRate(parseFloat(e.target.value)); });
-    this.settingsPanel.querySelector('.tts-voice-select').addEventListener('change', function (e) { self.setVoice(e.target.value || null); });
-
-    document.addEventListener('mousedown', function (e) {
-      if (self.settingsPanel.classList.contains('tts-visible')) {
-        if (!self.settingsPanel.contains(e.target) && !self.container.contains(e.target)) {
-          self.settingsPanel.classList.remove('tts-visible');
-        }
-      }
-    });
-
-    // "从这里开始朗读" 按钮点击
-    this.startHereBtn.addEventListener('click', function () {
-      var sel = window.getSelection();
-      var selText = sel ? sel.toString().trim() : '';
-      if (selText) { self.startFromSelection(selText); }
-      self.startHereBtn.style.display = 'none';
-    });
-
-    // 选区变化时显示/隐藏 startHere 按钮
-    // 条件：选区在正文容器内 + 选区文本足够长（>=3字符）
-    // cleanText 匹配失败时不阻止显示（让用户点击后再尝试定位）
-    document.addEventListener('selectionchange', function () {
-      var sel = window.getSelection();
-      if (!sel || sel.isCollapsed || !sel.toString().trim()) {
-        self.startHereBtn.style.display = 'none';
-        return;
-      }
-
-      // 找正文容器（可能为 null）
-      var contentEl = TextExtractor.findContentElement();
-      if (!contentEl) {
-        self.startHereBtn.style.display = 'none';
-        return;
-      }
-
-      // 选区文本太短则不显示
-      var rawSelText = sel.toString().trim();
-      if (rawSelText.length < 3) {
-        self.startHereBtn.style.display = 'none';
-        return;
-      }
-
-      // 检查选区是否在正文容器内
-      try {
-        var range = sel.getRangeAt(0);
-        if (!contentEl.contains(range.startContainer)) {
-          self.startHereBtn.style.display = 'none';
-          return;
-        }
-
-        var rect = range.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) {
-          self.startHereBtn.style.display = 'none';
-          return;
-        }
-
-        // 定位按钮到选区右上角
-        var top = rect.top + window.scrollY - 36;
-        var left = rect.right + window.scrollX - 80;
-        self.startHereBtn.style.top = (top > 10 ? top : rect.bottom + window.scrollY + 8) + 'px';
-        self.startHereBtn.style.left = (left > 10 ? left : rect.left + window.scrollX) + 'px';
-        self.startHereBtn.style.display = 'block';
-      } catch (e) {
-        self.startHereBtn.style.display = 'none';
-      }
-    });
-
-    console.log('[TTS] 微信读书听书功能已加载 (v3)');
-
-    // 初始化 Provider 管理 UI
-    this.initProviderUI();
+    log('TTS v4 已加载');
   }
-
-  TTSPlayer.prototype.checkAvailability = function () {
-    var avail = WebTTSEngine.checkAvailability();
-    if (!avail.supported) {
-      this.showError(avail.message);
-      this.disablePlayback();
-      return;
-    }
-    if (!avail.hasChineseVoice) {
-      console.warn('[TTS] ' + avail.message);
-    }
-  };
-
-  TTSPlayer.prototype.disablePlayback = function () {
-    var playBtn = this.container.querySelector('.tts-play-btn');
-    if (playBtn) { playBtn.style.opacity = '0.4'; playBtn.style.pointerEvents = 'none'; }
-  };
-
-  TTSPlayer.prototype.enablePlayback = function () {
-    var playBtn = this.container.querySelector('.tts-play-btn');
-    if (playBtn) { playBtn.style.opacity = '1'; playBtn.style.pointerEvents = 'auto'; }
-  };
 
   TTSPlayer.prototype.initVoices = function () {
     var self = this;
-    function loadVoices() {
-      var voices = WebTTSEngine.getChineseVoices();
-      if (voices.length > 0) {
-        self._voicesLoaded = true;
-        self.populateVoices(voices, self.settings.voiceName);
-        if (self.settings.voiceName) { var match = voices.find(function (v) { return v.name === self.settings.voiceName; }); if (match) self.engine._voice = match; }
-        self.hideError();
-        self.enablePlayback();
-        console.log('[TTS] 已加载', voices.length, '个中文语音');
-      } else if (!self._voicesLoaded) {
-        console.warn('[TTS] getVoices() 返回空，等待异步加载...');
-      }
-    }
-    if (speechSynthesis.onvoiceschanged !== undefined) { speechSynthesis.onvoiceschanged = loadVoices; }
-    loadVoices();
-    // Fallback：延迟重试
-    setTimeout(loadVoices, 200);
-    setTimeout(loadVoices, 1000);
-    // 最终兜底：3s 后如果仍无中文语音，显示提示
-    setTimeout(function () {
-      if (!self._voicesLoaded) {
-        var voices = WebTTSEngine.getChineseVoices();
-        if (voices.length === 0) {
-          self.showError('本机未检测到中文语音，朗读功能不可用。请在系统设置中安装中文语音包，或联系管理员配置云端 TTS。');
-          self.disablePlayback();
+    function load() {
+      var vs = WebTTSEngine.getChineseVoices();
+      if (vs.length > 0) {
+        self.populateVoices(vs);
+        if (self.settings.voiceName) {
+          var m = vs.find(function (v) { return v.name === self.settings.voiceName; });
+          if (m) self.engine._voice = m;
         }
       }
-    }, 3000);
+    }
+    if (speechSynthesis.onvoiceschanged) speechSynthesis.onvoiceschanged = load;
+    load();
+    setTimeout(load, 200);
+    setTimeout(load, 1000);
   };
 
-  TTSPlayer.prototype.populateVoices = function (voices, selectedName) {
-    var sel = this.settingsPanel.querySelector('.tts-voice-select');
+  TTSPlayer.prototype.populateVoices = function (voices) {
+    var sel = this.setEl.querySelector('.voice-sel');
     if (!sel) return;
     sel.innerHTML = '';
     voices.forEach(function (v) {
-      var opt = document.createElement('option');
-      opt.value = v.name;
-      opt.textContent = v.name + ' (' + v.lang + ')';
-      if (v.name === selectedName) opt.selected = true;
-      sel.appendChild(opt);
+      var o = document.createElement('option');
+      o.value = v.name;
+      o.textContent = v.name.replace(/.*\((.*)\)/, '$1');
+      if (v.name === self.settings.voiceName) o.selected = true;
+      sel.appendChild(o);
     });
   };
 
-  TTSPlayer.prototype.togglePlay = function () {
-    if (this.engine._isPlaying && !this.engine._isPaused) { this.engine.pause(); this.updatePlayIcon(false); }
-    else if (this.engine._isPaused) { this.engine.resume(); this.updatePlayIcon(true); }
-    else { this.extractAndPlay(); }
+  TTSPlayer.prototype.checkAvail = function () {
+    var a = WebTTSEngine.checkAvailability();
+    if (!a.supported) { this.showError(a.message); }
+    else if (!a.hasChineseVoice) { warn(a.message); }
   };
 
-  TTSPlayer.prototype.previous = function () { if (this.engine.previous()) { this.saveProgress(); this.updatePosition(); } };
-  TTSPlayer.prototype.next = function () { if (this.engine.next()) { this.saveProgress(); this.updatePosition(); } };
+  TTSPlayer.prototype.bindEvents = function () {
+    var self = this;
+    var bar = this.el.querySelector('.bar');
 
-  TTSPlayer.prototype.setRate = function (rate) {
-    this.engine._rate = Math.max(0.25, Math.min(4, rate));
-    this.settings.rate = rate;
+    bar.querySelector('.play-btn').onclick = function () { self.togglePlay(); };
+    bar.querySelector('.prev').onclick = function () { if (self.engine.previous()) { self.saveProgress(); self.updatePos(); } };
+    bar.querySelector('.next').onclick = function () { if (self.engine.next()) { self.saveProgress(); self.updatePos(); } };
+    bar.querySelector('.close-btn').onclick = function () { self.close(); };
+    bar.querySelector('.set-btn').onclick = function () { self.toggleSet(); };
+    this.el.querySelector('.err .close').onclick = function () { self.hideError(); };
+
+    bar.querySelector('.rate').onchange = function (e) { self.setRate(parseFloat(e.target.value)); };
+    this.setEl.querySelector('.rate-slider').oninput = function (e) { self.setRate(parseFloat(e.target.value)); };
+    this.setEl.querySelector('.voice-sel').onchange = function (e) { self.setVoice(e.target.value || null); };
+
+    // 点击外部关闭设置
+    document.addEventListener('mousedown', function (e) {
+      if (self.setEl.classList.contains('show') &&
+          !self.setEl.contains(e.target) && !self.el.contains(e.target)) {
+        self.setEl.classList.remove('show');
+      }
+    });
+
+    // 进度条点击跳转
+    this.el.querySelector('.pb-bg').onclick = function (e) {
+      if (!self.chunks.length) return;
+      var pct = e.offsetX / this.offsetWidth;
+      var targetIdx = Math.floor(pct * self.chunks.length);
+      targetIdx = Math.max(0, Math.min(targetIdx, self.chunks.length - 1));
+      self.engine.speakFrom(targetIdx, self.chunks);
+      self.updatePlayBtn(true);
+      self.updatePos();
+    };
+  };
+
+  /** 注入按钮到微信读书原生选区工具栏 */
+  TTSPlayer.prototype.injectToolbarButton = function () {
+    var self = this;
+    var injected = false;
+
+    function tryInject() {
+      // 微信读书选区工具栏的特征选择器
+      var toolbars = document.querySelectorAll(
+        '[class*="selection_bar"], [class*="selectBar"], ' +
+        '[class*="toolbar"][class*="select"], ' +
+        '[class*="menu"][class*="copy"], ' +
+        '.selection-bar, .select-toolbar, #selectionBar'
+      );
+
+      // 也尝试通过特征查找：包含"复制"文字的工具栏
+      if (toolbars.length === 0) {
+        var allDivs = document.querySelectorAll('div[style*="position"]');
+        for (var i = 0; i < allDivs.length; i++) {
+          var d = allDivs[i];
+          var txt = (d.textContent || '');
+          if ((txt.indexOf('复制') >= 0 || txt.indexOf('马克笔') >= 0) && d.children.length >= 2 && d.children.length <= 10) {
+            // 可能是工具栏
+            var rect = d.getBoundingClientRect();
+            if (rect.height > 20 && rect.height < 80 && rect.width > 200) {
+              toolbars = [d];
+              break;
+            }
+          }
+        }
+      }
+
+      for (var j = 0; j < toolbars.length; j++) {
+        var tb = toolbars[j];
+        // 避免重复注入
+        if (tb.querySelector('.wxr-tts-toolbar-btn')) continue;
+
+        var btn = document.createElement('button');
+        btn.className = 'wxr-tts-toolbar-btn';
+        btn.innerHTML = '&#128266; 朗读';
+        btn.title = '从这里开始朗读';
+        btn.onclick = function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          var selTxt = '';
+          try { selTxt = (window.getSelection() || {}).toString().trim() || ''; } catch(x) {}
+          if (selTxt) {
+            self.startFromSelection(selTxt);
+          } else {
+            // 没有选中文本，从当前位置开始
+            self.togglePlay();
+          }
+          // 点击后隐藏工具栏（模拟原生行为）
+          setTimeout(function () {
+            try { var s = window.getSelection(); if (s) s.removeAllRanges(); } catch(x) {}
+          }, 100);
+        };
+        tb.appendChild(btn);
+        log('已注入朗读按钮到选区工具栏');
+        injected = true;
+      }
+    }
+
+    // 立即尝试一次
+    tryInject();
+
+    // 用 MutationObserver 监控后续出现的工具栏
+    var observer = new MutationObserver(function () {
+      tryInject();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // 定时重试（工具栏可能延迟出现）
+    setInterval(tryInject, 1500);
+  };
+
+  // ---- 播放控制 ----
+
+  TTSPlayer.prototype.togglePlay = function () {
+    if (this.engine._isPlaying && !this.engine._isPaused) {
+      this.engine.pause();
+      this.updatePlayBtn(false);
+    } else if (this.engine._isPaused) {
+      this.engine.resume();
+      this.updatePlayBtn(true);
+    } else {
+      this.startReading();
+    }
+  };
+
+  TTSPlayer.prototype.startReading = function () {
+    var content = TextExtractor.extract();
+    if (!content) {
+      this.showError('无法提取文本，请确认已在阅读页面打开书籍');
+      return;
+    }
+
+    this.content = content;
+    this.chunks = this.engine.splitIntoChunks(content.text);
+    this.bookId = 'book_' + simpleHash(content.chapterTitle);
+    this.totalChunks = this.chunks.length;
+    PlaybackStore.setLastBookId(this.bookId);
+    this.hideError();
+
+    log('提取到文本:', content.text.length, '字,', this.chunks.length, '段');
+
+    // 自动续播：直接恢复，不需要弹窗确认
+    if (this.settings.autoResume) {
+      var saved = PlaybackStore.load(this.bookId);
+      if (saved && saved.chunkIndex > 0 && saved.chunkIndex < this.chunks.length) {
+        log('自动续播: 第', saved.chunkIndex + 1, '段 (共', saved.chunkIndex + '/' + saved.totalChunks + ')');
+        this.engine.speakFrom(saved.chunkIndex, this.chunks);
+        this.updateTitle(content.chapterTitle + ' (续播)');
+        this.updatePlayBtn(true);
+        this.updatePos();
+        this.engine._rate = saved.rate || this.settings.rate;
+        this.updateRateUI();
+        return;
+      }
+    }
+
+    // 从可视区域开始
+    var visIdx = TextExtractor.findVisibleChunkIndex(content.text, this.chunks);
+    if (visIdx > 0) {
+      log('从可视区域第', visIdx + 1, '段开始');
+      this.engine.speakFrom(visIdx, this.chunks);
+    } else {
+      this.engine.speak(content.text);
+    }
+    this.updateTitle(content.chapterTitle);
+    this.updatePlayBtn(true);
+    this.updatePos();
+  };
+
+  TTSPlayer.prototype.startFromSelection = function (selText) {
+    if (!selText) return;
+    var content = TextExtractor.extract();
+    if (!content) { this.showError('无法提取文本'); return; }
+
+    this.content = content;
+    this.chunks = this.engine.splitIntoChunks(content.text);
+    this.bookId = 'book_' + simpleHash(content.chapterTitle);
+    this.totalChunks = this.chunks.length;
+
+    // 在全文中定位选区
+    var cleanedSel = TextExtractor.cleanText(selText);
+    var charIdx = content.text.indexOf(cleanedSel);
+    if (charIdx === -1 && cleanedSel.length > 10) charIdx = content.text.indexOf(cleanedSel.slice(0, 30));
+
+    if (charIdx === -1) {
+      // 尝试用更短的前缀
+      for (var len = 20; len >= 5; len -= 5) {
+        charIdx = content.text.indexOf(cleanedSel.slice(0, len));
+        if (charIdx !== -1) break;
+      }
+    }
+
+    if (charIdx === -1) {
+      // 最终兜底：从可视区域开始
+      warn('无法定位选区，从可视区域开始');
+      charIdx = 0;
+    }
+
+    // 映射到 chunk
+    var offset = 0, chunkIdx = 0;
+    for (var i = 0; i < this.chunks.length; i++) {
+      if (charIdx >= offset && charIdx < offset + this.chunks[i].length) { chunkIdx = i; break; }
+      offset += this.chunks[i].length;
+    }
+
+    log('从选区开始: chunk', chunkIdx + 1, '/', this.chunks.length);
+    this.engine.speakFrom(chunkIdx, this.chunks);
+    this.updateTitle(content.chapterTitle + ' (从选区)');
+    this.updatePlayBtn(true);
+    this.updatePos();
+  };
+
+  TTSPlayer.prototype.close = function () {
+    this.engine.cancel();
+    this.el.style.display = 'none';
+    this.setEl.classList.remove('show');
+  };
+
+  TTSPlayer.prototype.toggleSet = function () { this.setEl.classList.toggle('show'); };
+
+  // ---- 设置 ----
+
+  TTSPlayer.prototype.setRate = function (r) {
+    this.engine._rate = Math.max(0.25, Math.min(4, r));
+    this.settings.rate = r;
     this.updateRateUI();
-    SettingsStore.save({ rate: rate });
+    SettingsStore.save({ rate: r });
   };
 
   TTSPlayer.prototype.setVoice = function (name) {
-    var voices = speechSynthesis.getVoices();
-    var match = name ? voices.find(function (v) { return v.name === name; }) : null;
-    this.engine._voice = match || null;
+    var vs = speechSynthesis.getVoices();
+    this.engine._voice = name ? (vs.find(function (v) { return v.name === name; }) || null) : null;
     this.settings.voiceName = name;
     SettingsStore.save({ voiceName: name });
   };
 
-  TTSPlayer.prototype.close = function () { this.engine.cancel(); this.container.classList.add('tts-hidden'); this.settingsPanel.classList.remove('tts-visible'); };
-  TTSPlayer.prototype.toggleSettings = function () { this.settingsPanel.classList.toggle('tts-visible'); };
+  // ---- UI 更新 ----
 
-  TTSPlayer.prototype.extractAndPlay = function () {
-    var content = TextExtractor.extract();
-    if (!content) { this.showError('未能提取到文本内容，请确保已在阅读页面打开一本书。'); return; }
-    this.currentContent = content;
-    this.currentChunks = this.chunkText(content.text);
-    this.bookId = this.makeBookId(content);
-    this.hideError();
-
-    if (this.settings.autoExtract) {
-      var saved = PlaybackStore.load(this.bookId);
-      if (saved && saved.chunkIndex > 0 && saved.chunkIndex < this.currentChunks.length) {
-        var isSame = PlaybackStore.matchesSavedState(this.bookId, content.text);
-        if (isSame) {
-          if (confirm('检测到上次在「' + saved.chapterTitle + '」第 ' + saved.chunkIndex + ' 段停止，是否继续？')) {
-            this.resumeFrom(saved);
-            return;
-          }
-        } else {
-          PlaybackStore.clear(this.bookId);
-        }
-      }
-    }
-
-    // 默认从当前可视区域中间的段落开始朗读
-    var visibleChunkIndex = TextExtractor.findVisibleChunkIndex(content.text, this.currentChunks);
-    if (visibleChunkIndex > 0) {
-      console.log('[TTS] 从可视区域第 ' + visibleChunkIndex + ' 段开始朗读');
-      this.engine.speakFrom(visibleChunkIndex, this.currentChunks);
-      this.setChapterTitle(content.chapterTitle);
-      this.setTotalChunks(this.currentChunks.length);
-      this.setCurrentIndex(visibleChunkIndex);
-      this.updatePlayIcon(true);
-    } else {
-      this.startNew(content);
-    }
+  TTSPlayer.prototype.updatePlayBtn = function (playing) {
+    var btn = this.el.querySelector('.play-btn');
+    if (!btn) return;
+    btn.textContent = playing ? '⏸' : '▶';
+    btn.className = 'play-btn' + (playing ? ' playing' : '');
+    btn.title = playing ? '暂停' : '播放';
   };
 
-  /** 从选中文本位置开始朗读（cleaned selection 优先 + Range+clean 备用） */
-  TTSPlayer.prototype.startFromSelection = function (selectedText) {
-    if (!selectedText) return;
-    var content = TextExtractor.extract();
-    if (!content) { this.showError('未能提取到文本内容'); return; }
-
-    this.currentContent = content;
-    this.currentChunks = this.chunkText(content.text);
-    this.bookId = this.makeBookId(content);
-
-    // 1. 优先通过 cleaned selection 在 cleaned fullText 中定位
-    var cleanedSel = TextExtractor.cleanText(selectedText);
-    var charIndex = -1;
-    if (cleanedSel && cleanedSel.length >= 3) {
-      charIndex = content.text.indexOf(cleanedSel);
-      if (charIndex >= 0) {
-        console.log('[TTS] cleaned match at ' + charIndex);
-      }
-    }
-
-    // 2. 备用：若 cleaned 匹配失败，尝试用 Range -> preRange -> clean -> lastIndexOf
-    if (charIndex === -1) {
-      var contentEl = TextExtractor.findContentElement();
-      if (contentEl) {
-        try {
-          var sel = window.getSelection();
-          if (sel && sel.rangeCount > 0) {
-            var range = sel.getRangeAt(0);
-            if (contentEl.contains(range.startContainer)) {
-              var preRange = document.createRange();
-              preRange.selectNodeContents(contentEl);
-              preRange.setEnd(range.startContainer, range.startOffset);
-              var preText = preRange.toString();
-              var cleanedPre = TextExtractor.cleanText(preText.slice(-200));
-              if (cleanedPre) {
-                var idx = content.text.lastIndexOf(cleanedPre);
-                if (idx !== -1) {
-                  charIndex = idx + Math.max(0, cleanedPre.length - 1);
-                  console.log('[TTS] Range+clean fallback at ' + charIndex);
-                }
-              }
-            }
-          }
-        } catch (e) { /* ignore */ }
-      }
-    }
-
-    // 3. 仍找不到，提示用户（不静默回退）
-    if (charIndex === -1) {
-      console.warn('[TTS] 无法精确定位选区在正文中的偏移');
-      alert('无法精确定位选区在正文中的位置，请在正文内选中文本或尝试稍微选取更多内容。');
-      return;
-    }
-
-    // 4. 把 charIndex 映射到 chunkIndex
-    var chunkIndex = 0, offset = 0;
-    for (var i = 0; i < this.currentChunks.length; i++) {
-      if (charIndex >= offset && charIndex < offset + this.currentChunks[i].length) {
-        chunkIndex = i;
-        break;
-      }
-      offset += this.currentChunks[i].length;
-    }
-
-    console.log('[TTS] 从选区开始朗读: charIndex=' + charIndex + ', chunkIndex=' + chunkIndex);
-    this.engine.speakFrom(chunkIndex, this.currentChunks);
-    this.setChapterTitle(content.chapterTitle);
-    this.setTotalChunks(this.currentChunks.length);
-    this.setCurrentIndex(chunkIndex);
-    this.updatePlayIcon(true);
+  TTSPlayer.prototype.updateTitle = function (t) {
+    var el = this.el.querySelector('.title');
+    if (el) el.textContent = t || '点击 ▶ 开始朗读';
   };
 
-  TTSPlayer.prototype.resumeFrom = function (state) {
-    var chunks = this.currentChunks;
-    this.engine.speakFrom(state.chunkIndex, chunks);
-    this.setChapterTitle(state.chapterTitle);
-    this.setTotalChunks(chunks.length);
-    this.setCurrentIndex(state.chunkIndex);
-    this.updatePlayIcon(true);
-    this.engine._rate = state.rate || this.settings.rate;
+  TTSPlayer.prototype.updatePos = function () {
+    this.currentIndex = this.engine.currentChunkIndex;
+    var total = this.totalChunks || 1;
+    var pos = this.currentIndex + '/' + total;
+    var posEl = this.el.querySelector('.pos');
+    var fill = this.el.querySelector('.pb-fill');
+    if (posEl) posEl.textContent = pos;
+    if (fill) fill.style.width = ((this.currentIndex / total) * 100) + '%';
   };
 
-  TTSPlayer.prototype.startNew = function (content) {
-    this.engine.speak(content.text);
-    this.setChapterTitle(content.chapterTitle);
-    this.setTotalChunks(this.engine.chunks.length);
-    this.setCurrentIndex(0);
-    this.updatePlayIcon(true);
-  };
-
-  TTSPlayer.prototype.onChunkEnd = function (index) { this.setCurrentIndex(index); this.saveProgress(); };
-  TTSPlayer.prototype.onAllEnd = function () { this.updatePlayIcon(false); this.setCurrentIndex(0); if (this.bookId) PlaybackStore.clear(this.bookId); };
-
-  TTSPlayer.prototype.onEngineError = function (chunkIndex, error) {
-    if (error === 'canceled' || error === 'interrupted') return;
-    if (error.indexOf('中文语音') >= 0 || error.indexOf('不支持') >= 0) { this.showError(error); }
-    else { this.showError('朗读出错（第' + chunkIndex + '段）：' + error); }
-  };
-
-  // ---- UI 辅助 ----
-  TTSPlayer.prototype.setChapterTitle = function (v) { var el = this.container.querySelector('.tts-chapter-title'); if (el) el.textContent = v || '未知章节'; };
-  TTSPlayer.prototype.setCurrentIndex = function (idx) {
-    this._currentIndex = idx;
-    var total = this._totalChunks || 1;
-    var posEl = this.container.querySelector('.tts-pos-text');
-    var fillEl = this.container.querySelector('.tts-progress-bar-fill');
-    if (posEl) posEl.textContent = idx + '/' + total;
-    if (fillEl) fillEl.style.width = ((idx / total) * 100) + '%';
-  };
-  TTSPlayer.prototype.setTotalChunks = function (v) { this._totalChunks = v; this.setCurrentIndex(this._currentIndex || 0); };
-  TTSPlayer.prototype.updatePlayIcon = function (playing) { var btn = this.container.querySelector('.tts-play-btn'); if (btn) btn.textContent = playing ? '⏸' : '▶'; };
   TTSPlayer.prototype.updateRateUI = function () {
-    var sel = this.container.querySelector('.tts-rate-select');
-    var slider = this.settingsPanel.querySelector('.tts-rate-slider');
-    var valLabel = this.settingsPanel.querySelector('.tts-rate-value');
+    var sel = this.el.querySelector('.rate');
+    var slider = this.setEl.querySelector('.rate-slider');
+    var val = this.setEl.querySelector('.rate-val');
     if (sel) sel.value = String(this.settings.rate);
     if (slider) slider.value = String(this.settings.rate);
-    if (valLabel) valLabel.textContent = this.settings.rate + 'x';
+    if (val) val.textContent = this.settings.rate + 'x';
   };
-  TTSPlayer.prototype.updatePosition = function () { this.setCurrentIndex(this.engine.currentChunkIndex); };
 
-  TTSPlayer.prototype.showError = function (message) {
-    var bar = this.container.querySelector('.tts-error-bar');
-    var msg = this.container.querySelector('.tts-error-msg');
-    if (bar && msg) { msg.textContent = message; bar.classList.add('tts-error-visible'); }
+  TTSPlayer.prototype.showError = function (msg) {
+    var err = this.el.querySelector('.err');
+    var msgEl = this.el.querySelector('.err .msg');
+    if (err && msgEl) { msgEl.textContent = msg; err.classList.add('show'); }
   };
+
   TTSPlayer.prototype.hideError = function () {
-    var bar = this.container.querySelector('.tts-error-bar');
-    if (bar) bar.classList.remove('tts-error-visible');
-  };
-
-  TTSPlayer.prototype.chunkText = function (text, maxChars) {
-    if (maxChars === undefined) maxChars = 300;
-    var re = /.*?[。！？\n]|.+$/gs;
-    var matches = [], m;
-    while ((m = re.exec(text)) !== null) { matches.push(m[0]); if (m[0].length === 0) { re.lastIndex++; } }
-    var chunks = [], buffer = '';
-    for (var i = 0; i < matches.length; i++) {
-      var trimmed = matches[i].trim();
-      if (!trimmed) continue;
-      if (trimmed.length > maxChars) {
-        if (buffer.trim()) { chunks.push(buffer.trim()); buffer = ''; }
-        for (var j = 0; j < trimmed.length; j += maxChars) { chunks.push(trimmed.slice(j, j + maxChars)); }
-        continue;
-      }
-      if ((buffer + trimmed).length > maxChars && buffer) { chunks.push(buffer.trim()); buffer = trimmed; }
-      else { buffer += trimmed; }
-    }
-    if (buffer.trim()) chunks.push(buffer.trim());
-    return chunks.length > 0 ? chunks : [text];
+    var err = this.el.querySelector('.err');
+    if (err) err.classList.remove('show');
   };
 
   TTSPlayer.prototype.saveProgress = function () {
-    if (!this.bookId || !this.currentContent) return;
-    PlaybackStore.save({
-      bookId: this.bookId,
-      chapterTitle: this.currentContent.chapterTitle,
-      chapterIndex: this.currentContent.chapterIndex,
+    if (!this.bookId || !this.content) return;
+    PlaybackStore.save(this.bookId, {
+      chapterTitle: this.content.chapterTitle,
       chunkIndex: this.engine.currentChunkIndex,
+      totalChunks: this.totalChunks,
       rate: this.engine._rate,
       voiceName: this.settings.voiceName
-    }, this.currentContent.text);
-  };
-
-  TTSPlayer.prototype.makeBookId = function (content) {
-    try { return 'book_' + location.hostname + '_' + btoa(content.chapterTitle).slice(0, 16); }
-    catch (e) { return 'book_' + Date.now(); }
-  };
-
-  // ============================================================
-  // 6. Provider 管理 UI（通过 electronTTS IPC 与主进程通信）
-  // ============================================================
-  TTSPlayer.prototype.initProviderUI = function () {
-    var self = this;
-    var settingsPanel = this.settingsPanel;
-
-    // 在设置面板底部添加"云端 TTS"区域
-    var providerSection = document.createElement('div');
-    providerSection.className = 'tts-provider-section';
-    providerSection.style.cssText = 'margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.08)';
-    providerSection.innerHTML =
-      '<div style="font-weight:600;margin-bottom:10px;font-size:13px">云端 TTS 服务</div>' +
-      '<div class="tts-provider-list" style="margin-bottom:10px"></div>' +
-      '<button class="tts-add-provider-btn" style="background:#1aad63;color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer;width:100%;margin-bottom:8px">+ 添加 TTS 服务</button>' +
-      '<div class="tts-provider-form" style="display:none">' +
-        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">服务名称</label><input class="tts-pf-name" type="text" placeholder="如：豆包 TTS" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"></div>' +
-        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">类型</label><select class="tts-pf-type" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"><option value="rest">REST API</option></select></div>' +
-        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">API 端点</label><input class="tts-pf-endpoint" type="text" placeholder="https://api.example.com/v1/tts" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"></div>' +
-        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">API Key</label><input class="tts-pf-apikey" type="password" placeholder="输入 API 密钥" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"></div>' +
-        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">音频格式</label><select class="tts-pf-format" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"><option value="mp3">MP3</option><option value="wav">WAV</option><option value="ogg">OGG</option></select></div>' +
-        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">默认语音（可选）</label><input class="tts-pf-voice" type="text" placeholder="如：zh_female_qingxin" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"></div>' +
-        '<div style="display:flex;gap:8px">' +
-          '<button class="tts-pf-submit" style="flex:1;background:#1aad63;color:#fff;border:none;border-radius:6px;padding:6px 0;font-size:12px;cursor:pointer">保存</button>' +
-          '<button class="tts-pf-cancel" style="flex:1;background:rgba(255,255,255,0.1);color:#ccc;border:none;border-radius:6px;padding:6px 0;font-size:12px;cursor:pointer">取消</button>' +
-        '</div>' +
-      '</div>';
-
-    settingsPanel.appendChild(providerSection);
-
-    // 添加按钮点击 → 显示表单
-    providerSection.querySelector('.tts-add-provider-btn').addEventListener('click', function () {
-      providerSection.querySelector('.tts-provider-form').style.display = 'block';
-      this.style.display = 'none';
-    });
-
-    // 取消按钮
-    providerSection.querySelector('.tts-pf-cancel').addEventListener('click', function () {
-      providerSection.querySelector('.tts-provider-form').style.display = 'none';
-      providerSection.querySelector('.tts-add-provider-btn').style.display = 'block';
-    });
-
-    // 保存按钮
-    providerSection.querySelector('.tts-pf-submit').addEventListener('click', async function () {
-      var name = providerSection.querySelector('.tts-pf-name').value.trim();
-      var type = providerSection.querySelector('.tts-pf-type').value;
-      var endpoint = providerSection.querySelector('.tts-pf-endpoint').value.trim();
-      var apiKey = providerSection.querySelector('.tts-pf-apikey').value.trim();
-      var format = providerSection.querySelector('.tts-pf-format').value;
-      var voice = providerSection.querySelector('.tts-pf-voice').value.trim();
-
-      if (!name || !endpoint || !apiKey) {
-        self.showError('请填写服务名称、API 端点和 API Key');
-        return;
-      }
-
-      try {
-        var result = await window.electronTTS.addProvider({
-          type: type, displayName: name, endpoint: endpoint,
-          apiKey: apiKey, audioFormat: format, voice: voice || undefined
-        });
-        if (result.success) {
-          self.showError(''); self.hideError();
-          providerSection.querySelector('.tts-provider-form').style.display = 'none';
-          providerSection.querySelector('.tts-add-provider-btn').style.display = 'block';
-          // 清空表单
-          providerSection.querySelector('.tts-pf-name').value = '';
-          providerSection.querySelector('.tts-pf-endpoint').value = '';
-          providerSection.querySelector('.tts-pf-apikey').value = '';
-          providerSection.querySelector('.tts-pf-voice').value = '';
-          self.loadProviderList();
-        } else {
-          self.showError('添加失败: ' + (result.error || '未知错误'));
-        }
-      } catch (e) {
-        self.showError('添加失败: ' + e.message);
-      }
-    });
-
-    // 初始加载 Provider 列表
-    this.loadProviderList();
-  };
-
-  TTSPlayer.prototype.loadProviderList = async function () {
-    var self = this;
-    var listEl = this.settingsPanel.querySelector('.tts-provider-list');
-    if (!listEl) return;
-
-    try {
-      var configs = await window.electronTTS.listProviderConfigs();
-      listEl.innerHTML = '';
-
-      if (!configs || configs.length === 0) {
-        listEl.innerHTML = '<div style="color:#888;font-size:11px;text-align:center;padding:8px">暂无云端 TTS 服务</div>';
-        return;
-      }
-
-      configs.forEach(function (cfg) {
-        var item = document.createElement('div');
-        item.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:6px 8px;border-radius:6px;margin-bottom:4px;background:rgba(255,255,255,0.05)';
-        item.innerHTML =
-          '<div style="flex:1;min-width:0">' +
-            '<div style="font-size:12px;color:#ddd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + cfg.displayName + '</div>' +
-            '<div style="font-size:10px;color:#888">' + cfg.type.toUpperCase() + (cfg.isDefault ? ' · 默认' : '') + (cfg.enabled ? '' : ' · 已停用') + '</div>' +
-          '</div>' +
-          '<div style="display:flex;gap:4px;flex-shrink:0">' +
-            '<button class="tts-prov-test" data-id="' + cfg.id + '" title="测试" style="background:rgba(255,255,255,0.08);border:none;color:#aaa;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer">测试</button>' +
-            '<button class="tts-prov-default" data-id="' + cfg.id + '" title="设为默认" style="background:rgba(255,255,255,0.08);border:none;color:#aaa;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer">' + (cfg.isDefault ? '★' : '☆') + '</button>' +
-            '<button class="tts-prov-del" data-id="' + cfg.id + '" title="删除" style="background:rgba(255,60,60,0.15);border:none;color:#f88;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer">×</button>' +
-          '</div>';
-        listEl.appendChild(item);
-      });
-
-      // 绑定事件
-      listEl.querySelectorAll('.tts-prov-test').forEach(function (btn) {
-        btn.addEventListener('click', async function () {
-          var id = this.getAttribute('data-id');
-          btn.textContent = '...';
-          try {
-            var result = await window.electronTTS.testProvider({ id: id });
-            btn.textContent = result.ok ? '✓' : '✗';
-            btn.title = result.message;
-            setTimeout(function () { btn.textContent = '测试'; }, 2000);
-          } catch (e) {
-            btn.textContent = '✗';
-            setTimeout(function () { btn.textContent = '测试'; }, 2000);
-          }
-        });
-      });
-
-      listEl.querySelectorAll('.tts-prov-default').forEach(function (btn) {
-        btn.addEventListener('click', async function () {
-          var id = this.getAttribute('data-id');
-          try {
-            await window.electronTTS.setDefaultProvider(id);
-            self.loadProviderList();
-          } catch (e) { /* ignore */ }
-        });
-      });
-
-      listEl.querySelectorAll('.tts-prov-del').forEach(function (btn) {
-        btn.addEventListener('click', async function () {
-          var id = this.getAttribute('data-id');
-          if (confirm('确定删除此 TTS 服务？')) {
-            try {
-              await window.electronTTS.removeProvider(id);
-              self.loadProviderList();
-            } catch (e) { /* ignore */ }
-          }
-        });
-      });
-
-    } catch (e) {
-      listEl.innerHTML = '<div style="color:#f88;font-size:11px;text-align:center;padding:8px">加载失败: ' + e.message + '</div>';
-    }
+    }, this.content.text);
   };
 
   // ============================================================
