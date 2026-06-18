@@ -2,8 +2,30 @@ import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
 import { app, BrowserWindow } from 'electron';
+import { initTTSIPC, registerProvider } from './main/tts/ttsService';
+import { RestTTSProvider } from './main/tts/providers/RestTTSProvider';
 
 dotenv.config();
+
+// ---- 初始化 TTS Service ----
+initTTSIPC();
+
+// 注册通用 REST Provider（从环境变量读取配置）
+// 使用方式：设置环境变量 TTS_REST_API_ENDPOINT 和 TTS_REST_API_KEY
+const restEndpoint = process.env.TTS_REST_API_ENDPOINT;
+const restApiKey = process.env.TTS_REST_API_KEY;
+if (restEndpoint && restApiKey) {
+  registerProvider(new RestTTSProvider({
+    id: 'rest-default',
+    displayName: '云端 TTS (REST)',
+    apiEndpoint: restEndpoint,
+    apiKey: restApiKey,
+    audioFormat: 'mp3',
+  }));
+  console.log('[Main] 已注册 REST TTS Provider');
+} else {
+  console.log('[Main] 未配置 REST TTS 环境变量，仅使用本地 Web Speech');
+}
 
 const createWindow = () => {
   // Create the browser window.
@@ -17,7 +39,8 @@ const createWindow = () => {
 
     webPreferences: {
       nodeIntegration: true,
-      contextIsolation: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js'),
     },
   });
 
