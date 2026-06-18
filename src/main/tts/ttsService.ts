@@ -6,6 +6,7 @@
 import { ipcMain } from 'electron';
 import { ITTSProvider, SynthOptions } from './providers/ITTSProvider';
 import { ensureCacheDir, hashKey, isCached, cacheFilePath, writeBufferToCache, touchCache, cleanupCacheIfNeeded, getCacheStats, clearAllCache } from './cacheManager';
+import { addProvider, removeProviderAction, listProviderConfigsAction, testProviderAction, setDefaultProviderAction, getDefaultProviderAction, updateProviderAction } from './providerManager';
 
 // ---- Provider Registry ----
 const providers = new Map<string, ITTSProvider>();
@@ -143,5 +144,65 @@ export function initTTSIPC(): void {
     return { success: true };
   });
 
-  console.log('[TTS Service] IPC handlers 已注册');
+  // ---- Provider 管理 IPC ----
+
+  // 添加 Provider
+  ipcMain.handle('tts/addProvider', async (_event, opts: {
+    type: string;
+    displayName: string;
+    endpoint?: string;
+    apiKey?: string;
+    audioFormat?: string;
+    voice?: string;
+  }) => {
+    try {
+      const cfg = await addProvider(opts);
+      return { success: true, config: cfg };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  });
+
+  // 删除 Provider
+  ipcMain.handle('tts/removeProvider', async (_event, id: string) => {
+    try {
+      await removeProviderAction(id);
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  });
+
+  // 列出所有 Provider 配置
+  ipcMain.handle('tts/listProviderConfigs', async () => {
+    return listProviderConfigsAction();
+  });
+
+  // 测试 Provider
+  ipcMain.handle('tts/testProvider', async (_event, opts: { id: string; text?: string }) => {
+    return testProviderAction(opts.id, opts.text);
+  });
+
+  // 设置默认 Provider
+  ipcMain.handle('tts/setDefaultProvider', async (_event, id: string) => {
+    await setDefaultProviderAction(id);
+    return { success: true };
+  });
+
+  // 获取默认 Provider
+  ipcMain.handle('tts/getDefaultProvider', async () => {
+    return getDefaultProviderAction();
+  });
+
+  // 更新 Provider
+  ipcMain.handle('tts/updateProvider', async (_event, id: string, partial: Partial<import('./providerConfigStore').ProviderConfig> & { apiKey?: string }) => {
+    try {
+      const cfg = await updateProviderAction(id, partial);
+      return { success: true, config: cfg };
+    } catch (err) {
+      return { success: false, error: (err as Error).message };
+    }
+  });
+
+  console.log('[TTS Service] IPC handlers 已注册（含 Provider 管理）');
 }

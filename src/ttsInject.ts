@@ -441,6 +441,9 @@
     });
 
     console.log('[TTS] 微信读书听书功能已加载 (v3)');
+
+    // 初始化 Provider 管理 UI
+    this.initProviderUI();
   }
 
   TTSPlayer.prototype.checkAvailability = function () {
@@ -717,6 +720,163 @@
   TTSPlayer.prototype.makeBookId = function (content) {
     try { return 'book_' + location.hostname + '_' + btoa(content.chapterTitle).slice(0, 16); }
     catch (e) { return 'book_' + Date.now(); }
+  };
+
+  // ============================================================
+  // 6. Provider 管理 UI（通过 electronTTS IPC 与主进程通信）
+  // ============================================================
+  TTSPlayer.prototype.initProviderUI = function () {
+    var self = this;
+    var settingsPanel = this.settingsPanel;
+
+    // 在设置面板底部添加"云端 TTS"区域
+    var providerSection = document.createElement('div');
+    providerSection.className = 'tts-provider-section';
+    providerSection.style.cssText = 'margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.08)';
+    providerSection.innerHTML =
+      '<div style="font-weight:600;margin-bottom:10px;font-size:13px">云端 TTS 服务</div>' +
+      '<div class="tts-provider-list" style="margin-bottom:10px"></div>' +
+      '<button class="tts-add-provider-btn" style="background:#1aad63;color:#fff;border:none;border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer;width:100%;margin-bottom:8px">+ 添加 TTS 服务</button>' +
+      '<div class="tts-provider-form" style="display:none">' +
+        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">服务名称</label><input class="tts-pf-name" type="text" placeholder="如：豆包 TTS" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"></div>' +
+        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">类型</label><select class="tts-pf-type" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"><option value="rest">REST API</option></select></div>' +
+        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">API 端点</label><input class="tts-pf-endpoint" type="text" placeholder="https://api.example.com/v1/tts" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"></div>' +
+        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">API Key</label><input class="tts-pf-apikey" type="password" placeholder="输入 API 密钥" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"></div>' +
+        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">音频格式</label><select class="tts-pf-format" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"><option value="mp3">MP3</option><option value="wav">WAV</option><option value="ogg">OGG</option></select></div>' +
+        '<div style="margin-bottom:8px"><label style="color:#aaa;font-size:11px;display:block;margin-bottom:3px">默认语音（可选）</label><input class="tts-pf-voice" type="text" placeholder="如：zh_female_qingxin" style="width:100%;padding:5px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#ddd;font-size:12px;box-sizing:border-box"></div>' +
+        '<div style="display:flex;gap:8px">' +
+          '<button class="tts-pf-submit" style="flex:1;background:#1aad63;color:#fff;border:none;border-radius:6px;padding:6px 0;font-size:12px;cursor:pointer">保存</button>' +
+          '<button class="tts-pf-cancel" style="flex:1;background:rgba(255,255,255,0.1);color:#ccc;border:none;border-radius:6px;padding:6px 0;font-size:12px;cursor:pointer">取消</button>' +
+        '</div>' +
+      '</div>';
+
+    settingsPanel.appendChild(providerSection);
+
+    // 添加按钮点击 → 显示表单
+    providerSection.querySelector('.tts-add-provider-btn').addEventListener('click', function () {
+      providerSection.querySelector('.tts-provider-form').style.display = 'block';
+      this.style.display = 'none';
+    });
+
+    // 取消按钮
+    providerSection.querySelector('.tts-pf-cancel').addEventListener('click', function () {
+      providerSection.querySelector('.tts-provider-form').style.display = 'none';
+      providerSection.querySelector('.tts-add-provider-btn').style.display = 'block';
+    });
+
+    // 保存按钮
+    providerSection.querySelector('.tts-pf-submit').addEventListener('click', async function () {
+      var name = providerSection.querySelector('.tts-pf-name').value.trim();
+      var type = providerSection.querySelector('.tts-pf-type').value;
+      var endpoint = providerSection.querySelector('.tts-pf-endpoint').value.trim();
+      var apiKey = providerSection.querySelector('.tts-pf-apikey').value.trim();
+      var format = providerSection.querySelector('.tts-pf-format').value;
+      var voice = providerSection.querySelector('.tts-pf-voice').value.trim();
+
+      if (!name || !endpoint || !apiKey) {
+        self.showError('请填写服务名称、API 端点和 API Key');
+        return;
+      }
+
+      try {
+        var result = await window.electronTTS.addProvider({
+          type: type, displayName: name, endpoint: endpoint,
+          apiKey: apiKey, audioFormat: format, voice: voice || undefined
+        });
+        if (result.success) {
+          self.showError(''); self.hideError();
+          providerSection.querySelector('.tts-provider-form').style.display = 'none';
+          providerSection.querySelector('.tts-add-provider-btn').style.display = 'block';
+          // 清空表单
+          providerSection.querySelector('.tts-pf-name').value = '';
+          providerSection.querySelector('.tts-pf-endpoint').value = '';
+          providerSection.querySelector('.tts-pf-apikey').value = '';
+          providerSection.querySelector('.tts-pf-voice').value = '';
+          self.loadProviderList();
+        } else {
+          self.showError('添加失败: ' + (result.error || '未知错误'));
+        }
+      } catch (e) {
+        self.showError('添加失败: ' + e.message);
+      }
+    });
+
+    // 初始加载 Provider 列表
+    this.loadProviderList();
+  };
+
+  TTSPlayer.prototype.loadProviderList = async function () {
+    var self = this;
+    var listEl = this.settingsPanel.querySelector('.tts-provider-list');
+    if (!listEl) return;
+
+    try {
+      var configs = await window.electronTTS.listProviderConfigs();
+      listEl.innerHTML = '';
+
+      if (!configs || configs.length === 0) {
+        listEl.innerHTML = '<div style="color:#888;font-size:11px;text-align:center;padding:8px">暂无云端 TTS 服务</div>';
+        return;
+      }
+
+      configs.forEach(function (cfg) {
+        var item = document.createElement('div');
+        item.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:6px 8px;border-radius:6px;margin-bottom:4px;background:rgba(255,255,255,0.05)';
+        item.innerHTML =
+          '<div style="flex:1;min-width:0">' +
+            '<div style="font-size:12px;color:#ddd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + cfg.displayName + '</div>' +
+            '<div style="font-size:10px;color:#888">' + cfg.type.toUpperCase() + (cfg.isDefault ? ' · 默认' : '') + (cfg.enabled ? '' : ' · 已停用') + '</div>' +
+          '</div>' +
+          '<div style="display:flex;gap:4px;flex-shrink:0">' +
+            '<button class="tts-prov-test" data-id="' + cfg.id + '" title="测试" style="background:rgba(255,255,255,0.08);border:none;color:#aaa;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer">测试</button>' +
+            '<button class="tts-prov-default" data-id="' + cfg.id + '" title="设为默认" style="background:rgba(255,255,255,0.08);border:none;color:#aaa;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer">' + (cfg.isDefault ? '★' : '☆') + '</button>' +
+            '<button class="tts-prov-del" data-id="' + cfg.id + '" title="删除" style="background:rgba(255,60,60,0.15);border:none;color:#f88;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer">×</button>' +
+          '</div>';
+        listEl.appendChild(item);
+      });
+
+      // 绑定事件
+      listEl.querySelectorAll('.tts-prov-test').forEach(function (btn) {
+        btn.addEventListener('click', async function () {
+          var id = this.getAttribute('data-id');
+          btn.textContent = '...';
+          try {
+            var result = await window.electronTTS.testProvider({ id: id });
+            btn.textContent = result.ok ? '✓' : '✗';
+            btn.title = result.message;
+            setTimeout(function () { btn.textContent = '测试'; }, 2000);
+          } catch (e) {
+            btn.textContent = '✗';
+            setTimeout(function () { btn.textContent = '测试'; }, 2000);
+          }
+        });
+      });
+
+      listEl.querySelectorAll('.tts-prov-default').forEach(function (btn) {
+        btn.addEventListener('click', async function () {
+          var id = this.getAttribute('data-id');
+          try {
+            await window.electronTTS.setDefaultProvider(id);
+            self.loadProviderList();
+          } catch (e) { /* ignore */ }
+        });
+      });
+
+      listEl.querySelectorAll('.tts-prov-del').forEach(function (btn) {
+        btn.addEventListener('click', async function () {
+          var id = this.getAttribute('data-id');
+          if (confirm('确定删除此 TTS 服务？')) {
+            try {
+              await window.electronTTS.removeProvider(id);
+              self.loadProviderList();
+            } catch (e) { /* ignore */ }
+          }
+        });
+      });
+
+    } catch (e) {
+      listEl.innerHTML = '<div style="color:#f88;font-size:11px;text-align:center;padding:8px">加载失败: ' + e.message + '</div>';
+    }
   };
 
   // ============================================================

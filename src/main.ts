@@ -4,6 +4,7 @@ import * as path from 'path';
 import { app, BrowserWindow } from 'electron';
 import { initTTSIPC, registerProvider } from './main/tts/ttsService';
 import { RestTTSProvider } from './main/tts/providers/RestTTSProvider';
+import { loadAndRegisterAllProviders } from './main/tts/providerManager';
 
 dotenv.config();
 
@@ -11,7 +12,6 @@ dotenv.config();
 initTTSIPC();
 
 // 注册通用 REST Provider（从环境变量读取配置）
-// 使用方式：设置环境变量 TTS_REST_API_ENDPOINT 和 TTS_REST_API_KEY
 const restEndpoint = process.env.TTS_REST_API_ENDPOINT;
 const restApiKey = process.env.TTS_REST_API_KEY;
 if (restEndpoint && restApiKey) {
@@ -26,6 +26,11 @@ if (restEndpoint && restApiKey) {
 } else {
   console.log('[Main] 未配置 REST TTS 环境变量，仅使用本地 Web Speech');
 }
+
+// 启动时加载用户保存的 Provider 配置并注册
+loadAndRegisterAllProviders().catch((err) => {
+  console.error('[Main] 加载已保存的 Provider 配置失败:', err);
+});
 
 const createWindow = () => {
   // Create the browser window.

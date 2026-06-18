@@ -1,6 +1,5 @@
 // Preload script
-// 由于当前项目 contextIsolation: false，renderer 可直接使用 ipcRenderer
-// 此文件保留为未来启用 contextIsolation 时的桥接入口
+// 通过 contextBridge 安全暴露 TTS API 给 renderer
 
 import { contextBridge, ipcRenderer } from 'electron';
 
@@ -18,4 +17,28 @@ contextBridge.exposeInMainWorld('electronTTS', {
 
   /** 清理缓存 */
   clearCache: () => ipcRenderer.invoke('tts/clearCache'),
+
+  // ---- Provider 管理 ----
+
+  /** 添加 Provider */
+  addProvider: (opts: { type: string; displayName: string; endpoint?: string; apiKey?: string; audioFormat?: string; voice?: string }) =>
+    ipcRenderer.invoke('tts/addProvider', opts),
+
+  /** 删除 Provider */
+  removeProvider: (id: string) => ipcRenderer.invoke('tts/removeProvider', id),
+
+  /** 列出所有 Provider 配置 */
+  listProviderConfigs: () => ipcRenderer.invoke('tts/listProviderConfigs'),
+
+  /** 测试 Provider */
+  testProvider: (opts: { id: string; text?: string }) => ipcRenderer.invoke('tts/testProvider', opts),
+
+  /** 设置默认 Provider */
+  setDefaultProvider: (id: string) => ipcRenderer.invoke('tts/setDefaultProvider', id),
+
+  /** 获取默认 Provider */
+  getDefaultProvider: () => ipcRenderer.invoke('tts/getDefaultProvider'),
+
+  /** 更新 Provider */
+  updateProvider: (id: string, partial: any) => ipcRenderer.invoke('tts/updateProvider', id, partial),
 });
