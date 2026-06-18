@@ -484,7 +484,9 @@ export class PlayerUI {
       this.startHereBtn.style.display = 'none';
     });
 
-    // 选区变化时显示/隐藏 startHere 按钮（只在正文容器内且 cleaned 匹配成功时才显示）
+    // 选区变化时显示/隐藏 startHere 按钮
+    // 条件：选区在正文容器内 + 选区文本足够长（>=3字符）
+    // cleanText 匹配失败时不阻止显示（让用户点击后再尝试定位）
     document.addEventListener('selectionchange', () => {
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed || !sel.toString().trim()) {
@@ -499,29 +501,28 @@ export class PlayerUI {
         return;
       }
 
-      // 清洗选区文本并在 fullText 中快速匹配
+      // 选区文本太短则不显示
       const rawSelText = sel.toString().trim();
-      const cleanedSel = TextExtractor.cleanText(rawSelText);
-      if (!cleanedSel || cleanedSel.length < 3) {
+      if (rawSelText.length < 3) {
         this.startHereBtn.style.display = 'none';
         return;
       }
 
-      // 提取正文并尝试匹配
-      const content = TextExtractor.extract();
-      if (!content || content.text.indexOf(cleanedSel) === -1) {
-        this.startHereBtn.style.display = 'none';
-        return;
-      }
-
-      // 匹配成功，定位按钮
+      // 检查选区是否在正文容器内
       try {
         const range = sel.getRangeAt(0);
+        if (!contentEl.contains(range.startContainer)) {
+          this.startHereBtn.style.display = 'none';
+          return;
+        }
+
         const rect = range.getBoundingClientRect();
         if (rect.width === 0 && rect.height === 0) {
           this.startHereBtn.style.display = 'none';
           return;
         }
+
+        // 定位按钮到选区右上角
         const top = rect.top + window.scrollY - 36;
         const left = rect.right + window.scrollX - 80;
         this.startHereBtn.style.top = (top > 10 ? top : rect.bottom + window.scrollY + 8) + 'px';

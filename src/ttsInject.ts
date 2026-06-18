@@ -186,12 +186,48 @@
       return { text: text.trim(), chapterTitle: TextExtractor.extractChapterTitle(), chapterIndex: TextExtractor.extractChapterInfo().index, totalChapters: TextExtractor.extractChapterInfo().total };
     },
     extractText: function () {
+      // 策略0（最精确）：在正文容器内只提取段落级元素
+      var contentEl = TextExtractor.findContentElement();
+      if (contentEl) {
+        var paragraphs = contentEl.querySelectorAll('p');
+        if (paragraphs.length > 0) {
+          var texts = [];
+          for (var pi = 0; pi < paragraphs.length; pi++) {
+            var p = paragraphs[pi];
+            var ptext = (p.textContent || '').trim();
+            if (ptext.length < 2) continue;
+            var rect = p.getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) continue;
+            texts.push(ptext);
+          }
+          if (texts.length > 0) {
+            var combined = texts.join('\n');
+            var cleaned = TextExtractor.cleanText(combined);
+            if (cleaned.length > 20) return cleaned;
+          }
+        }
+        // 如果没找到 p，用容器的 textContent 但排除非正文子元素
+        var filtered = TextExtractor.extractFilteredContent(contentEl);
+        if (filtered.length > 20) return filtered;
+      }
+
+      // 策略1：微信读书渲染层常用选择器
       var selectors = ['.readerContent', '.render-text-container', '[class*="readerText"]', '[class*="render_text"]', '.text-content', 'article', '.content', '#j_content', 'main'];
       for (var i = 0; i < selectors.length; i++) {
         var el = document.querySelector(selectors[i]);
         if (el) { var t = TextExtractor.cleanText(el.textContent || ''); if (t.length > 20) return t; }
       }
       return TextExtractor.scanForContent();
+    },
+    /** 从容器中提取正文，排除注释、脚注、侧栏等非正文子元素 */
+    extractFilteredContent: function (container) {
+      var clone = container.cloneNode(true);
+      var excludeSelectors = ['nav', 'header', 'footer', 'aside', '[role="navigation"]', '[role="complementary"]', '.footnote', '.annotation', '.comment', '.note', '.sidebar', '.toolbar', '.menu', '.breadcrumb', 'script', 'style', 'noscript', '[class*="foot"]', '[class*="note"]', '[class*="comment"]', '[class*="sidebar"]', '[class*="toolbar"]', '[class*="menu"]', '[class*="header"]', '[class*="footer"]'];
+      for (var i = 0; i < excludeSelectors.length; i++) {
+        var els = clone.querySelectorAll(excludeSelectors[i]);
+        for (var j = 0; j < els.length; j++) { els[j].remove(); }
+      }
+      return TextExtractor.cleanText(clone.textContent || '');
     },
     cleanText: function (raw) {
       return raw.replace(/\s+/g, ' ').replace(/[^\u4e00-\u9fa5a-zA-Z0-9，。！？、；：""''（）\n\r\s\.\,\!\?\;\:\(\)\-\—]/g, '').trim();
@@ -243,6 +279,36 @@
       preRange.selectNodeContents(container);
       preRange.setEnd(range.startContainer, range.startOffset);
       return preRange.toString().length;
+    },
+    /** 找到当前可视区域中间的段落文本，映射到 chunkIndex，返回 0 表示无法定位 */
+    findVisibleChunkIndex: function (fullText, chunks) {
+      var contentEl = TextExtractor.findContentElement();
+      if (!contentEl) return 0;
+      var viewportCenter = window.innerHeight / 2;
+      var paragraphs = contentEl.querySelectorAll('p, div.readerChapterContent, span, [class*="text"]');
+      var bestEl = null, bestDistance = Infinity;
+      for (var i = 0; i < paragraphs.length; i++) {
+        var p = paragraphs[i];
+        var rect = p.getBoundingClientRect();
+        if (rect.height === 0) continue;
+        var elCenter = rect.top + rect.height / 2;
+        var distance = Math.abs(elCenter - viewportCenter);
+        if (rect.top < window.innerHeight && rect.bottom > 0 && distance < bestDistance) {
+          bestDistance = distance; bestEl = p;
+        }
+      }
+      if (!bestEl) return 0;
+      var elText = TextExtractor.cleanText(bestEl.textContent || '');
+      if (!elText || elText.length < 4) return 0;
+      var charIndex = fullText.indexOf(elText);
+      if (charIndex === -1 && elText.length > 20) charIndex = fullText.indexOf(elText.slice(0, 20));
+      if (charIndex === -1) return 0;
+      var offset = 0;
+      for (var i = 0; i < chunks.length; i++) {
+        if (charIndex >= offset && charIndex < offset + chunks[i].length) return i;
+        offset += chunks[i].length;
+      }
+      return 0;
     },
     extractChapterTitle: function () {
       var selectors = ['.chapter-title', '.chapter_title', '[class*="chapterTitle"]', '.current-chapter h1', '.chapterInfo_title', 'h1.title', '.title'];
@@ -418,7 +484,9 @@
       self.startHereBtn.style.display = 'none';
     });
 
-    // 选区变化时显示/隐藏 startHere 按钮（只在正文容器内且 cleaned 匹配成功时才显示）
+    // 选区变化时显示/隐藏 startHere 按钮
+    // 条件：选区在正文容器内 + 选区文本足够长（>=3字符）
+    // cleanText 匹配失败时不阻止显示（让用户点击后再尝试定位）
     document.addEventListener('selectionchange', function () {
       var sel = window.getSelection();
       if (!sel || sel.isCollapsed || !sel.toString().trim()) {
@@ -433,29 +501,28 @@
         return;
       }
 
-      // 清洗选区文本并在 fullText 中快速匹配
+      // 选区文本太短则不显示
       var rawSelText = sel.toString().trim();
-      var cleanedSel = TextExtractor.cleanText(rawSelText);
-      if (!cleanedSel || cleanedSel.length < 3) {
+      if (rawSelText.length < 3) {
         self.startHereBtn.style.display = 'none';
         return;
       }
 
-      // 提取正文并尝试匹配
-      var content = TextExtractor.extract();
-      if (!content || content.text.indexOf(cleanedSel) === -1) {
-        self.startHereBtn.style.display = 'none';
-        return;
-      }
-
-      // 匹配成功，定位按钮
+      // 检查选区是否在正文容器内
       try {
         var range = sel.getRangeAt(0);
+        if (!contentEl.contains(range.startContainer)) {
+          self.startHereBtn.style.display = 'none';
+          return;
+        }
+
         var rect = range.getBoundingClientRect();
         if (rect.width === 0 && rect.height === 0) {
           self.startHereBtn.style.display = 'none';
           return;
         }
+
+        // 定位按钮到选区右上角
         var top = rect.top + window.scrollY - 36;
         var left = rect.right + window.scrollX - 80;
         self.startHereBtn.style.top = (top > 10 ? top : rect.bottom + window.scrollY + 8) + 'px';
@@ -588,7 +655,19 @@
         }
       }
     }
-    this.startNew(content);
+
+    // 默认从当前可视区域中间的段落开始朗读
+    var visibleChunkIndex = TextExtractor.findVisibleChunkIndex(content.text, this.currentChunks);
+    if (visibleChunkIndex > 0) {
+      console.log('[TTS] 从可视区域第 ' + visibleChunkIndex + ' 段开始朗读');
+      this.engine.speakFrom(visibleChunkIndex, this.currentChunks);
+      this.setChapterTitle(content.chapterTitle);
+      this.setTotalChunks(this.currentChunks.length);
+      this.setCurrentIndex(visibleChunkIndex);
+      this.updatePlayIcon(true);
+    } else {
+      this.startNew(content);
+    }
   };
 
   /** 从选中文本位置开始朗读（cleaned selection 优先 + Range+clean 备用） */

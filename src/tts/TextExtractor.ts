@@ -35,17 +35,45 @@ export class TextExtractor {
 
   /**
    * 提取正文文本（多策略尝试）
+   * 优先提取正文段落级元素（p），而非整个容器（避免包含侧栏/注释）
    */
   private static extractText(): string {
+    // 策略0（最精确）：在正文容器内只提取段落级元素
+    const contentEl = TextExtractor.findContentElement();
+    if (contentEl) {
+      // 优先找 p 标签（微信读书正文通常用 p）
+      const paragraphs = contentEl.querySelectorAll('p');
+      if (paragraphs.length > 0) {
+        const texts: string[] = [];
+        for (const p of Array.from(paragraphs)) {
+          // 跳过太短的（可能是标签/按钮）和不可见的
+          const text = (p.textContent || '').trim();
+          if (text.length < 2) continue;
+          const rect = p.getBoundingClientRect();
+          // 跳过隐藏元素
+          if (rect.width === 0 && rect.height === 0) continue;
+          texts.push(text);
+        }
+        if (texts.length > 0) {
+          const combined = texts.join('\n');
+          const cleaned = TextExtractor.cleanText(combined);
+          if (cleaned.length > 20) return cleaned;
+        }
+      }
+
+      // 如果没找到 p，用容器的 textContent 但排除非正文子元素
+      const filtered = TextExtractor.extractFilteredContent(contentEl);
+      if (filtered.length > 20) return filtered;
+    }
+
+    // 策略1：微信读书渲染层常用选择器
     const selectors = [
-      // 微信读书渲染容器
       '.readerContent',
       '.render-text-container',
       '[class*="readerText"]',
       '[class*="render_text"]',
       '.text-content',
       'article',
-      // 通用备选
       '.content',
       '#j_content',
       'main',
@@ -62,6 +90,33 @@ export class TextExtractor {
     // 兜底：遍历所有可能的内容区域
     const allText = TextExtractor.scanForContent();
     return allText;
+  }
+
+  /**
+   * 从容器中提取正文，排除注释、脚注、侧栏等非正文子元素
+   */
+  private static extractFilteredContent(container: Element): string {
+    // 克隆容器以避免修改原始 DOM
+    const clone = container.cloneNode(true) as Element;
+
+    // 移除非正文子元素
+    const excludeSelectors = [
+      'nav', 'header', 'footer', 'aside',
+      '[role="navigation"]', '[role="complementary"]',
+      '.footnote', '.annotation', '.comment', '.note',
+      '.sidebar', '.toolbar', '.menu', '.breadcrumb',
+      'script', 'style', 'noscript',
+      '[class*="foot"]', '[class*="note"]', '[class*="comment"]',
+      '[class*="sidebar"]', '[class*="toolbar"]', '[class*="menu"]',
+      '[class*="header"]', '[class*="footer"]',
+    ];
+
+    for (const sel of excludeSelectors) {
+      const els = clone.querySelectorAll(sel);
+      els.forEach((el) => el.remove());
+    }
+
+    return TextExtractor.cleanText(clone.textContent || '');
   }
 
   /**
@@ -193,6 +248,63 @@ export class TextExtractor {
     preRange.selectNodeContents(container);
     preRange.setEnd(range.startContainer, range.startOffset);
     return preRange.toString().length;
+  }
+
+  /**
+   * 找到当前可视区域中间的段落文本，在 fullText 中定位后映射到 chunkIndex
+   * 返回 0 表示无法定位（从头开始）
+   */
+  static findVisibleChunkIndex(fullText: string, chunks: string[]): number {
+    const contentEl = TextExtractor.findContentElement();
+    if (!contentEl) return 0;
+
+    // 获取可视区域中心点
+    const viewportCenter = window.innerHeight / 2;
+
+    // 在正文容器内找到可视区域中心附近的段落元素
+    const paragraphs = contentEl.querySelectorAll('p, div.readerChapterContent, span, [class*="text"]');
+    let bestEl: Element | null = null;
+    let bestDistance = Infinity;
+
+    for (const p of Array.from(paragraphs)) {
+      const rect = p.getBoundingClientRect();
+      if (rect.height === 0) continue;
+
+      const elCenter = rect.top + rect.height / 2;
+      const distance = Math.abs(elCenter - viewportCenter);
+
+      // 只考虑在可视区域内的元素
+      if (rect.top < window.innerHeight && rect.bottom > 0 && distance < bestDistance) {
+        bestDistance = distance;
+        bestEl = p;
+      }
+    }
+
+    if (!bestEl) return 0;
+
+    // 用该元素的文本在 fullText 中定位
+    const elText = TextExtractor.cleanText(bestEl.textContent || '');
+    if (!elText || elText.length < 4) return 0;
+
+    // 尝试在 fullText 中找到该段落
+    let charIndex = fullText.indexOf(elText);
+    if (charIndex === -1 && elText.length > 20) {
+      // 模糊匹配：用前 20 字符
+      charIndex = fullText.indexOf(elText.slice(0, 20));
+    }
+
+    if (charIndex === -1) return 0;
+
+    // 把 charIndex 映射到 chunkIndex
+    let offset = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      if (charIndex >= offset && charIndex < offset + chunks[i].length) {
+        return i;
+      }
+      offset += chunks[i].length;
+    }
+
+    return 0;
   }
 
   /**

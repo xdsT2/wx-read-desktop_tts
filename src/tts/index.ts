@@ -189,6 +189,7 @@ export class TTSPlayer {
 
   /**
    * 提取页面文本并开始朗读
+   * 默认从当前可视区域中间的段落开始，而非从头
    */
   extractAndPlay(): void {
     const content = TextExtractor.extract();
@@ -219,7 +220,19 @@ export class TTSPlayer {
       }
     }
 
-    this.startNew(content, this.currentChunks.map((c) => c.text));
+    // 默认从当前可视区域中间的段落开始朗读
+    const visibleChunkIndex = TextExtractor.findVisibleChunkIndex(content.text, this.currentChunks.map((c) => c.text));
+    if (visibleChunkIndex > 0) {
+      console.log(`[TTS] 从可视区域第 ${visibleChunkIndex} 段开始朗读`);
+      const chunks = this.currentChunks.map((c) => c.text);
+      this.engine.speakFrom(visibleChunkIndex, chunks);
+      this.ui.chapterTitle = content.chapterTitle;
+      this.ui.totalChunks = chunks.length;
+      this.ui.currentIndex = visibleChunkIndex;
+      this.ui.playing = true;
+    } else {
+      this.startNew(content, this.currentChunks.map((c) => c.text));
+    }
   }
 
   /**
