@@ -264,14 +264,10 @@ export class TTSPlayer {
       }
     }
 
-    // 3. 仍找不到，从头开始
+    // 3. 仍找不到，提示用户（不静默回退到从头开始）
     if (charIndex === -1) {
-      console.warn('[TTS] 无法精确定位选区在正文中的偏移，已从当前章节开头开始朗读');
-      this.engine.speak(content.text);
-      this.ui.chapterTitle = content.chapterTitle;
-      this.ui.totalChunks = this.engine.totalChunks;
-      this.ui.currentIndex = 0;
-      this.ui.playing = true;
+      console.warn('[TTS] 无法精确定位选区在正文中的偏移');
+      this.ui.showError('无法精确定位选区位置，请在正文内选中文本或选取更多内容。');
       return;
     }
 

@@ -3,6 +3,8 @@
  * 在微信读书页面右下角显示控制条，包含：播放/暂停、上/下一章、语速、设置按钮
  */
 
+import { TextExtractor } from './TextExtractor';
+
 // ---- CSS 样式 ----
 export const PLAYER_STYLES = `
 #wx-read-tts-player {
@@ -482,7 +484,7 @@ export class PlayerUI {
       this.startHereBtn.style.display = 'none';
     });
 
-    // 选区变化时显示/隐藏 startHere 按钮
+    // 选区变化时显示/隐藏 startHere 按钮（只在正文容器内才显示）
     document.addEventListener('selectionchange', () => {
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed || !sel.toString().trim()) {
@@ -496,9 +498,18 @@ export class PlayerUI {
           this.startHereBtn.style.display = 'none';
           return;
         }
+        // 只在选区位于正文容器内时才显示按钮
+        const contentEl = TextExtractor.findContentElement();
+        if (!contentEl || (!contentEl.contains(range.startContainer) && !contentEl.contains(range.endContainer))) {
+          this.startHereBtn.style.display = 'none';
+          return;
+        }
+        // 定位按钮到选区右上角
+        const top = rect.top + window.scrollY - 36;
+        const left = rect.right + window.scrollX - 80;
+        this.startHereBtn.style.top = (top > 10 ? top : rect.bottom + window.scrollY + 8) + 'px';
+        this.startHereBtn.style.left = (left > 10 ? left : rect.left + window.scrollX) + 'px';
         this.startHereBtn.style.display = 'block';
-        this.startHereBtn.style.top = (rect.top + window.scrollY - 36) + 'px';
-        this.startHereBtn.style.left = (rect.left + window.scrollX + rect.width / 2 - 60) + 'px';
       } catch {
         this.startHereBtn.style.display = 'none';
       }

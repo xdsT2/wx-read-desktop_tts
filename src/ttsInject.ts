@@ -418,7 +418,7 @@
       self.startHereBtn.style.display = 'none';
     });
 
-    // 选区变化时显示/隐藏 startHere 按钮
+    // 选区变化时显示/隐藏 startHere 按钮（只在正文容器内才显示）
     document.addEventListener('selectionchange', function () {
       var sel = window.getSelection();
       if (!sel || sel.isCollapsed || !sel.toString().trim()) {
@@ -432,9 +432,18 @@
           self.startHereBtn.style.display = 'none';
           return;
         }
+        // 只在选区位于正文容器内时才显示按钮
+        var contentEl = TextExtractor.findContentElement();
+        if (!contentEl || (!contentEl.contains(range.startContainer) && !contentEl.contains(range.endContainer))) {
+          self.startHereBtn.style.display = 'none';
+          return;
+        }
+        // 定位按钮到选区右上角
+        var top = rect.top + window.scrollY - 36;
+        var left = rect.right + window.scrollX - 80;
+        self.startHereBtn.style.top = (top > 10 ? top : rect.bottom + window.scrollY + 8) + 'px';
+        self.startHereBtn.style.left = (left > 10 ? left : rect.left + window.scrollX) + 'px';
         self.startHereBtn.style.display = 'block';
-        self.startHereBtn.style.top = (rect.top + window.scrollY - 36) + 'px';
-        self.startHereBtn.style.left = (rect.left + window.scrollX + rect.width / 2 - 60) + 'px';
       } catch (e) {
         self.startHereBtn.style.display = 'none';
       }
@@ -596,14 +605,10 @@
       }
     }
 
-    // 3. 仍找不到，从头开始
+    // 3. 仍找不到，提示用户（不静默回退到从头开始）
     if (charIndex === -1) {
-      console.warn('[TTS] 无法精确定位选区在正文中的偏移，已从当前章节开头开始朗读');
-      this.engine.speak(content.text);
-      this.setChapterTitle(content.chapterTitle);
-      this.setTotalChunks(this.engine.chunks.length);
-      this.setCurrentIndex(0);
-      this.updatePlayIcon(true);
+      console.warn('[TTS] 无法精确定位选区在正文中的偏移');
+      alert('无法精确定位选区在正文中的位置，请在正文内选中文本或尝试稍微选取更多内容。');
       return;
     }
 
