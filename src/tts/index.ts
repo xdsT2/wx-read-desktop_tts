@@ -224,7 +224,9 @@ export class TTSPlayer {
 
   /**
    * 从选中文本位置开始朗读
-   * 模糊匹配：先精确匹配选中文本，再尝试前60字符，最后回退到从头开始
+   * 优先使用 Range API 精确计算选区在正文容器内的字符偏移，
+   * 比 indexOf 更可靠（正确处理 DOM text node 分割、空格差异等）
+   * 若选区不在正文容器内，退回用文本模糊匹配
    */
   startFromSelection(selectedText: string): void {
     if (!selectedText) return;
@@ -240,19 +242,31 @@ export class TTSPlayer {
     this.bookId = this.generateBookId(content);
     const chunks = this.currentChunks.map((c) => c.text);
 
-    // 在全文中查找选中文本的位置
-    const fullText = content.text;
-    let charIndex = fullText.indexOf(selectedText);
+    // 1. 优先用 Range API 精确计算选区在正文容器内的字符偏移
+    const contentEl = TextExtractor.findContentElement();
+    const domOffset = TextExtractor.getSelectionOffsetInContainer(contentEl);
 
-    // 模糊匹配：尝试前60字符
-    if (charIndex === -1 && selectedText.length > 10) {
-      const prefix = selectedText.slice(0, Math.min(60, selectedText.length));
-      charIndex = fullText.indexOf(prefix);
+    let charIndex = -1;
+    if (domOffset >= 0) {
+      // 选区在正文容器内，直接用 DOM 偏移
+      charIndex = domOffset;
+      console.log(`[TTS] Range API 定位: domOffset=${domOffset}`);
+    } else {
+      // 2. 选区不在正文容器内，退回用文本模糊匹配
+      const fullText = content.text;
+      charIndex = fullText.indexOf(selectedText);
+      if (charIndex === -1 && selectedText.length > 10) {
+        const prefix = selectedText.slice(0, Math.min(60, selectedText.length));
+        charIndex = fullText.indexOf(prefix);
+      }
+      if (charIndex >= 0) {
+        console.log(`[TTS] 文本模糊匹配定位: charIndex=${charIndex}`);
+      }
     }
 
-    // 仍找不到，从头开始
+    // 3. 仍找不到，从头开始
     if (charIndex === -1) {
-      console.warn('[TTS] 选中文本未在章节全文中找到，从头开始朗读');
+      console.warn('[TTS] 无法精确定位选区在正文中的偏移，已从当前章节开头开始朗读');
       this.engine.speak(content.text);
       this.ui.chapterTitle = content.chapterTitle;
       this.ui.totalChunks = this.engine.totalChunks;
@@ -261,7 +275,7 @@ export class TTSPlayer {
       return;
     }
 
-    // 通过累积偏移找到对应的 chunk 索引
+    // 4. 把 charIndex 映射到 chunkIndex
     let chunkIndex = 0;
     let offset = 0;
     for (let i = 0; i < chunks.length; i++) {

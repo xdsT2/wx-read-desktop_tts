@@ -211,6 +211,39 @@
       }
       return bestEl ? TextExtractor.cleanText(bestEl.textContent || '') : '';
     },
+    /** 找到正文容器的 DOM 元素（与 extractText 使用相同的选择器优先级） */
+    findContentElement: function () {
+      var selectors = ['.readerContent', '.render-text-container', '[class*="readerText"]', '[class*="render_text"]', '.text-content', 'article', '.content', '#j_content', 'main'];
+      for (var i = 0; i < selectors.length; i++) {
+        var el = document.querySelector(selectors[i]);
+        if (el && (el.textContent || '').trim().length > 20) return el;
+      }
+      // 兜底：用 scanForContent 的逻辑找最佳元素
+      var bestEl = null, maxLength = 0;
+      var skipSelectors = ['nav', 'header', 'footer', 'aside', '[role="navigation"]', 'script', 'style', '.toolbar', '.sidebar'];
+      var candidates = document.querySelectorAll('div, section, article, main');
+      for (var i = 0; i < candidates.length; i++) {
+        var el2 = candidates[i];
+        var shouldSkip = false;
+        for (var j = 0; j < skipSelectors.length; j++) { if (el2.matches(skipSelectors[j]) || el2.closest(skipSelectors[j])) { shouldSkip = true; break; } }
+        if (shouldSkip) continue;
+        var text = (el2.textContent || '').trim();
+        var chineseCount = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+        if (chineseCount > maxLength && chineseCount > 50) { maxLength = chineseCount; bestEl = el2; }
+      }
+      return bestEl || document.body;
+    },
+    /** 计算当前选区在指定容器内的字符偏移（Range API），返回 -1 表示选区不在容器内 */
+    getSelectionOffsetInContainer: function (container) {
+      var sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0) return -1;
+      var range = sel.getRangeAt(0);
+      if (!container.contains(range.startContainer)) return -1;
+      var preRange = document.createRange();
+      preRange.selectNodeContents(container);
+      preRange.setEnd(range.startContainer, range.startOffset);
+      return preRange.toString().length;
+    },
     extractChapterTitle: function () {
       var selectors = ['.chapter-title', '.chapter_title', '[class*="chapterTitle"]', '.current-chapter h1', '.chapterInfo_title', 'h1.title', '.title'];
       for (var i = 0; i < selectors.length; i++) { var el = document.querySelector(selectors[i]); if (el && el.textContent && el.textContent.trim()) return el.textContent.trim(); }
@@ -529,7 +562,7 @@
     this.startNew(content);
   };
 
-  /** 从选中文本位置开始朗读 */
+  /** 从选中文本位置开始朗读（Range API 精确定位 + 模糊匹配兜底） */
   TTSPlayer.prototype.startFromSelection = function (selectedText) {
     if (!selectedText) return;
     var content = TextExtractor.extract();
@@ -539,17 +572,30 @@
     this.currentChunks = this.chunkText(content.text);
     this.bookId = this.makeBookId(content);
 
-    var fullText = content.text;
-    var charIndex = fullText.indexOf(selectedText);
+    // 1. 优先用 Range API 精确计算选区在正文容器内的字符偏移
+    var contentEl = TextExtractor.findContentElement();
+    var domOffset = TextExtractor.getSelectionOffsetInContainer(contentEl);
 
-    // 模糊匹配：尝试前60字符
-    if (charIndex === -1 && selectedText.length > 10) {
-      var prefix = selectedText.slice(0, Math.min(60, selectedText.length));
-      charIndex = fullText.indexOf(prefix);
+    var charIndex = -1;
+    if (domOffset >= 0) {
+      charIndex = domOffset;
+      console.log('[TTS] Range API 定位: domOffset=' + domOffset);
+    } else {
+      // 2. 选区不在正文容器内，退回用文本模糊匹配
+      var fullText = content.text;
+      charIndex = fullText.indexOf(selectedText);
+      if (charIndex === -1 && selectedText.length > 10) {
+        var prefix = selectedText.slice(0, Math.min(60, selectedText.length));
+        charIndex = fullText.indexOf(prefix);
+      }
+      if (charIndex >= 0) {
+        console.log('[TTS] 文本模糊匹配定位: charIndex=' + charIndex);
+      }
     }
 
+    // 3. 仍找不到，从头开始
     if (charIndex === -1) {
-      console.warn('[TTS] 选中文本未在章节全文中找到，从头开始朗读');
+      console.warn('[TTS] 无法精确定位选区在正文中的偏移，已从当前章节开头开始朗读');
       this.engine.speak(content.text);
       this.setChapterTitle(content.chapterTitle);
       this.setTotalChunks(this.engine.chunks.length);
@@ -558,7 +604,7 @@
       return;
     }
 
-    // 通过累积偏移找到 chunk 索引
+    // 4. 把 charIndex 映射到 chunkIndex
     var chunkIndex = 0, offset = 0;
     for (var i = 0; i < this.currentChunks.length; i++) {
       if (charIndex >= offset && charIndex < offset + this.currentChunks[i].length) {

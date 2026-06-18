@@ -134,6 +134,67 @@ export class TextExtractor {
   }
 
   /**
+   * 找到正文容器的 DOM 元素（与 extractText 使用相同的选择器优先级）
+   * 用于计算选区在正文内的精确字符偏移
+   */
+  static findContentElement(): HTMLElement {
+    const selectors = [
+      '.readerContent',
+      '.render-text-container',
+      '[class*="readerText"]',
+      '[class*="render_text"]',
+      '.text-content',
+      'article',
+      '.content',
+      '#j_content',
+      'main',
+    ];
+
+    for (const selector of selectors) {
+      const el = document.querySelector(selector) as HTMLElement | null;
+      if (el && (el.textContent || '').trim().length > 20) return el;
+    }
+
+    // 兜底：用 scanForContent 的逻辑找最佳元素
+    let bestEl: HTMLElement | null = null;
+    let maxLength = 0;
+    const skipSelectors = ['nav', 'header', 'footer', 'aside', '[role="navigation"]', 'script', 'style', '.toolbar', '.sidebar'];
+    const candidates = Array.from(document.querySelectorAll('div, section, article, main'));
+    for (const el of candidates) {
+      let shouldSkip = false;
+      for (const sel of skipSelectors) {
+        if (el.matches(sel) || el.closest(sel)) { shouldSkip = true; break; }
+      }
+      if (shouldSkip) continue;
+      const text = (el.textContent || '').trim();
+      const chineseCount = text.match(/[\u4e00-\u9fa5]/g)?.length || 0;
+      if (chineseCount > maxLength && chineseCount > 50) {
+        maxLength = chineseCount;
+        bestEl = el as HTMLElement;
+      }
+    }
+
+    return bestEl || document.body;
+  }
+
+  /**
+   * 计算当前选区在指定容器内的字符偏移
+   * 使用 Range API 精确计算，正确处理 text node 分割和内联标签
+   * 返回 -1 表示选区不在容器内
+   */
+  static getSelectionOffsetInContainer(container: HTMLElement): number {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return -1;
+    const range = sel.getRangeAt(0);
+    if (!container.contains(range.startContainer)) return -1;
+
+    const preRange = document.createRange();
+    preRange.selectNodeContents(container);
+    preRange.setEnd(range.startContainer, range.startOffset);
+    return preRange.toString().length;
+  }
+
+  /**
    * 提取章节索引信息
    */
   private static extractChapterInfo(): { index: number; total: number } {
