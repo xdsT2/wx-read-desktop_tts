@@ -188,6 +188,25 @@ export const PLAYER_STYLES = `
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   font-size: 14px;
 }
+
+/* 错误提示条 */
+#wx-read-tts-player .tts-error-bar {
+  display: none;
+  background: rgba(180, 60, 60, 0.9);
+  color: #ffe0e0;
+  font-size: 11px;
+  padding: 6px 12px;
+  border-radius: 0 0 14px 14px;
+  margin-top: -4px;
+  line-height: 1.4;
+}
+#wx-read-tts-player .tts-error-bar.tts-error-visible { display: block; }
+#wx-read-tts-player .tts-error-bar .tts-error-close {
+  float: right;
+  cursor: pointer;
+  margin-left: 8px;
+  font-weight: bold;
+}
 `;
 
 // ---- HTML 模板 ----
@@ -222,6 +241,7 @@ export function createPlayerHTML(): string {
     <button class="tts-btn tts-settings-btn" title="设置">⚙</button>
     <button class="tts-btn tts-close-btn" title="关闭">×</button>
   </div>
+  <div class="tts-error-bar"><span class="tts-error-close">×</span><span class="tts-error-msg"></span></div>
 </div>
 
 <div id="wx-read-tts-settings">
@@ -343,6 +363,22 @@ export class PlayerUI {
     });
   }
 
+  /** 显示错误提示 */
+  showError(message: string): void {
+    const bar = this.container.querySelector('.tts-error-bar');
+    const msg = this.container.querySelector('.tts-error-msg');
+    if (bar && msg) {
+      msg.textContent = message;
+      bar.classList.add('tts-error-visible');
+    }
+  }
+
+  /** 隐藏错误提示 */
+  hideError(): void {
+    const bar = this.container.querySelector('.tts-error-bar');
+    if (bar) bar.classList.remove('tts-error-visible');
+  }
+
   constructor(callbacks: PlayerUICallbacks) {
     // 注入样式
     const styleEl = document.createElement('style');
@@ -400,5 +436,8 @@ export class PlayerUI {
         }
       }
     });
+
+    // 错误条关闭按钮
+    this.container.querySelector('.tts-error-close')?.addEventListener('click', () => this.hideError());
   }
 }

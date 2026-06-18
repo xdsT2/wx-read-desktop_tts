@@ -1,1 +1,1 @@
-{"compilerOptions": {"module": "commonjs", "target": "ES5", "noImplicitAny": false, "sourceMap": true, "strict": false, "outDir": "tsout", "baseUrl": ".", "typeRoots": ["typing"], "paths": {"*": ["node_modules/*"]}}, "include": ["src/**/*"], "exclude": ["src/ttsInject.ts"]}
+{"compilerOptions": {"module": "commonjs", "target": "ES5", "downlevelIteration": true, "noImplicitAny": false, "sourceMap": true, "strict": false, "outDir": "tsout", "baseUrl": ".", "typeRoots": ["typing"], "paths": {"*": ["node_modules/*"]}}, "include": ["src/**/*"], "exclude": ["src/ttsInject.ts"]}

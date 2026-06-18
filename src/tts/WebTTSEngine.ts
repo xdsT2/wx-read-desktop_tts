@@ -1,7 +1,17 @@
 /**
  * Web Speech API TTS 引擎封装
  * 支持：播放/暂停/恢复/停止、语速调节、音色选择、逐段朗读回调
+ * 改进：增加可用性检测、错误回调、中文语音回退提示
  */
+
+export interface TTSAvailability {
+  supported: boolean;       // speechSynthesis API 是否存在
+  hasChineseVoice: boolean; // 是否有中文语音
+  voices: SpeechSynthesisVoice[]; // 所有中文语音
+  allVoices: SpeechSynthesisVoice[]; // 所有语音
+  message: string;          // 可读的状态描述
+}
+
 export class WebTTSEngine {
   private utterance: SpeechSynthesisUtterance | null = null;
   private currentChunkIndex = 0;
@@ -12,6 +22,46 @@ export class WebTTSEngine {
   private _isPaused = false;
   private onChunkEnd?: (index: number) => void;
   private onAllEnd?: () => void;
+  private onError?: (chunkIndex: number, error: string) => void;
+
+  /**
+   * 检测 Web Speech API 的可用性
+   * 返回详细的可用性报告，包括中文语音检测
+   */
+  static checkAvailability(): TTSAvailability {
+    if (!('speechSynthesis' in window)) {
+      return {
+        supported: false,
+        hasChineseVoice: false,
+        voices: [],
+        allVoices: [],
+        message: '当前浏览器不支持 Web Speech API。请考虑升级浏览器或使用云端 TTS 服务。',
+      };
+    }
+
+    const allVoices = speechSynthesis.getVoices();
+    const chineseVoices = allVoices.filter(
+      (v) => v.lang.startsWith('zh') || v.lang.includes('CN')
+    );
+
+    if (chineseVoices.length === 0) {
+      return {
+        supported: true,
+        hasChineseVoice: false,
+        voices: [],
+        allVoices,
+        message: 'Web Speech API 可用，但未检测到中文语音。请在系统设置中安装中文语音包，或切换到云端 TTS。',
+      };
+    }
+
+    return {
+      supported: true,
+      hasChineseVoice: true,
+      voices: chineseVoices,
+      allVoices,
+      message: `Web Speech API 可用，检测到 ${chineseVoices.length} 个中文语音。`,
+    };
+  }
 
   /** 获取系统可用中文语音列表 */
   static getChineseVoices(): SpeechSynthesisVoice[] {
@@ -59,9 +109,11 @@ export class WebTTSEngine {
   setCallbacks(opts: {
     onChunkEnd?: (index: number) => void;
     onAllEnd?: () => void;
+    onError?: (chunkIndex: number, error: string) => void;
   }): void {
     this.onChunkEnd = opts.onChunkEnd;
     this.onAllEnd = opts.onAllEnd;
+    this.onError = opts.onError;
   }
 
   /**
@@ -69,9 +121,20 @@ export class WebTTSEngine {
    */
   speak(text: string): void {
     if (!('speechSynthesis' in window)) {
-      console.error('[TTS] 浏览器不支持 Web Speech API');
+      const msg = '浏览器不支持 Web Speech API，无法朗读。请切换到云端 TTS 服务。';
+      console.error('[TTS] ' + msg);
+      this.onError?.(0, msg);
       return;
     }
+
+    // 检测中文语音
+    const chineseVoices = WebTTSEngine.getChineseVoices();
+    if (chineseVoices.length === 0 && !this._voice) {
+      console.warn('[TTS] 未检测到中文语音，将使用默认语音（可能无法正确朗读中文）');
+      // 不阻止播放，但通知上层
+      this.onError?.(0, '未检测到中文语音，朗读效果可能不佳。建议安装中文语音包或切换云端 TTS。');
+    }
+
     this.cancel();
     this.chunks = this.splitIntoChunks(text);
     this.currentChunkIndex = 0;
@@ -167,10 +230,15 @@ export class WebTTSEngine {
     };
 
     this.utterance.onerror = (event) => {
-      console.warn(`[TTS] 片段 ${this.currentChunkIndex} 朗读错误:`, event.error);
-      this.currentChunkIndex++;
-      if (this._isPlaying && !this._isPaused) {
-        this.speakCurrentChunk();
+      const errMsg = `片段 ${this.currentChunkIndex} 朗读错误: ${event.error}`;
+      console.warn('[TTS] ' + errMsg);
+      this.onError?.(this.currentChunkIndex, event.error);
+      // 非中断性错误（如 canceled）不跳过
+      if (event.error !== 'canceled' && event.error !== 'interrupted') {
+        this.currentChunkIndex++;
+        if (this._isPlaying && !this._isPaused) {
+          this.speakCurrentChunk();
+        }
       }
     };
 
@@ -182,14 +250,26 @@ export class WebTTSEngine {
    * 按句号、问号、感叹号、换行切分，每片不超过 maxChars 字符
    */
   private splitIntoChunks(text: string, maxChars = 300): string[] {
-    // 按中文标点和换行分割
-    const sentences = text.split(/(?<=[。！？\n])/g);
+    // 用 matchAll 保留分隔符的切分
+    const pattern = /.*?[。！？\n]|.+$/gs;
+    const matches = [...text.matchAll(pattern)];
     const chunks: string[] = [];
     let buffer = '';
 
-    for (const sentence of sentences) {
+    for (const match of matches) {
+      const sentence = match[0];
+      if (!sentence) continue;
       const trimmed = sentence.trim();
       if (!trimmed) continue;
+
+      // 超长无标点句强制按字符切分
+      if (trimmed.length > maxChars) {
+        if (buffer.trim()) { chunks.push(buffer.trim()); buffer = ''; }
+        for (let i = 0; i < trimmed.length; i += maxChars) {
+          chunks.push(trimmed.slice(i, i + maxChars));
+        }
+        continue;
+      }
 
       if ((buffer + trimmed).length > maxChars && buffer) {
         chunks.push(buffer.trim());
