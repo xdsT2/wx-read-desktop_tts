@@ -7,6 +7,8 @@
  * - 断点续播时重新从页面提取文本并分片
  * - 增加 onError 回调，UI 展示错误提示
  * - 启动时检测 speechSynthesis 可用性
+ * - "从这里开始朗读" 选区浮动按钮
+ * - 更健壮的 initVoices（onvoiceschanged + fallback timeout）
  */
 
 import { WebTTSEngine } from './WebTTSEngine';
@@ -22,6 +24,7 @@ export class TTSPlayer {
   private currentContent: ExtractedContent | null = null;
   private currentChunks: ChunkInfo[] = [];
   private bookId = '';
+  private _availability: { supported: boolean; hasChineseVoice: boolean } = { supported: false, hasChineseVoice: false };
 
   constructor() {
     this.engine = new WebTTSEngine();
@@ -33,6 +36,7 @@ export class TTSPlayer {
       onVoiceChange: (name) => this.setVoice(name),
       onClose: () => this.close(),
       onExtractClick: () => this.extractAndPlay(),
+      onStartFromSelection: (selText) => this.startFromSelection(selText),
     });
 
     // 加载保存的设置
@@ -46,7 +50,7 @@ export class TTSPlayer {
       onError: (chunkIndex, error) => this.onEngineError(chunkIndex, error),
     });
 
-    // 初始化语音列表（异步加载）
+    // 初始化语音列表（异步加载 + fallback timeout）
     this.initVoices();
 
     // 显示播放器
@@ -62,28 +66,57 @@ export class TTSPlayer {
   /** 检测 Web Speech API 可用性并给出提示 */
   private checkAvailability(): void {
     const avail = WebTTSEngine.checkAvailability();
+    this._availability = { supported: avail.supported, hasChineseVoice: avail.hasChineseVoice };
+
     if (!avail.supported) {
       this.ui.showError(avail.message);
+      this.disablePlayback();
       return;
     }
-    if (!avail.hasChineseVoice && this.settings.showFallbackHint) {
-      this.ui.showError(avail.message);
+    if (!avail.hasChineseVoice) {
+      // 语音可能稍后异步加载，先不立即禁用
+      console.warn('[TTS] ' + avail.message);
     }
   }
 
-  /** 初始化可用语音列表 */
+  /** 禁用播放按钮（当 TTS 完全不可用时） */
+  private disablePlayback(): void {
+    const playBtn = document.querySelector('#wx-read-tts-player .tts-play-btn') as HTMLElement;
+    if (playBtn) {
+      playBtn.style.opacity = '0.4';
+      playBtn.style.pointerEvents = 'none';
+    }
+  }
+
+  /** 启用播放按钮 */
+  private enablePlayback(): void {
+    const playBtn = document.querySelector('#wx-read-tts-player .tts-play-btn') as HTMLElement;
+    if (playBtn) {
+      playBtn.style.opacity = '1';
+      playBtn.style.pointerEvents = 'auto';
+    }
+  }
+
+  /** 初始化可用语音列表（更健壮：onvoiceschanged + fallback timeout） */
   private initVoices(): void {
+    let voicesLoaded = false;
+
     const loadVoices = () => {
       const voices = WebTTSEngine.getChineseVoices();
       if (voices.length > 0) {
+        voicesLoaded = true;
         this.ui.populateVoices(voices, this.settings.voiceName);
-        // 如果有保存的音色，自动设置
         if (this.settings.voiceName) {
           const match = voices.find((v) => v.name === this.settings.voiceName);
           if (match) this.engine.voice = match;
         }
-        // 有中文语音后清除错误提示
         this.ui.hideError();
+        this._availability.hasChineseVoice = true;
+        this.enablePlayback();
+        console.log('[TTS] 已加载', voices.length, '个中文语音');
+      } else if (!voicesLoaded) {
+        // 仍无中文语音，但 API 可用
+        console.warn('[TTS] getVoices() 返回空，等待异步加载...');
       }
     };
 
@@ -93,6 +126,20 @@ export class TTSPlayer {
     }
     // 立即尝试一次（某些浏览器已就绪）
     loadVoices();
+
+    // Fallback：延迟 200ms 和 1000ms 再试一次（防止 onvoiceschanged 不触发）
+    setTimeout(loadVoices, 200);
+    setTimeout(loadVoices, 1000);
+    // 最终兜底：3s 后如果仍无中文语音，显示提示
+    setTimeout(() => {
+      if (!voicesLoaded) {
+        const voices = WebTTSEngine.getChineseVoices();
+        if (voices.length === 0) {
+          this.ui.showError('本机未检测到中文语音，朗读功能不可用。请在系统设置中安装中文语音包，或联系管理员配置云端 TTS。');
+          this.disablePlayback();
+        }
+      }
+    }, 3000);
   }
 
   // ---- 播放控制 ----
@@ -105,7 +152,6 @@ export class TTSPlayer {
       this.engine.resume();
       this.ui.playing = true;
     } else {
-      // 开始新朗读
       this.extractAndPlay();
     }
   }
@@ -155,14 +201,12 @@ export class TTSPlayer {
     this.currentChunks = TextChunker.chunk(content.text);
     this.bookId = this.generateBookId(content);
 
-    // 清除之前的错误提示
     this.ui.hideError();
 
     // 检查是否有断点可恢复
     if (this.settings.autoExtract) {
       const saved = PlaybackStore.load(this.bookId);
       if (saved && saved.chunkIndex > 0 && saved.chunkIndex < this.currentChunks.length) {
-        // 验证章节文本是否变更
         const isSameChapter = PlaybackStore.matchesSavedState(this.bookId, content.text);
         if (isSameChapter) {
           if (confirm(`检测到上次在「${saved.chapterTitle}」第 ${saved.chunkIndex} 段停止，是否继续？`)) {
@@ -170,22 +214,76 @@ export class TTSPlayer {
             return;
           }
         } else {
-          // 章节已变更，清除旧断点
           PlaybackStore.clear(this.bookId);
         }
       }
     }
 
-    // 正常开始
     this.startNew(content, this.currentChunks.map((c) => c.text));
   }
 
   /**
+   * 从选中文本位置开始朗读
+   * 模糊匹配：先精确匹配选中文本，再尝试前60字符，最后回退到从头开始
+   */
+  startFromSelection(selectedText: string): void {
+    if (!selectedText) return;
+
+    const content = TextExtractor.extract();
+    if (!content) {
+      this.ui.showError('未能提取到文本内容，请确保已在阅读页面打开一本书。');
+      return;
+    }
+
+    this.currentContent = content;
+    this.currentChunks = TextChunker.chunk(content.text);
+    this.bookId = this.generateBookId(content);
+    const chunks = this.currentChunks.map((c) => c.text);
+
+    // 在全文中查找选中文本的位置
+    const fullText = content.text;
+    let charIndex = fullText.indexOf(selectedText);
+
+    // 模糊匹配：尝试前60字符
+    if (charIndex === -1 && selectedText.length > 10) {
+      const prefix = selectedText.slice(0, Math.min(60, selectedText.length));
+      charIndex = fullText.indexOf(prefix);
+    }
+
+    // 仍找不到，从头开始
+    if (charIndex === -1) {
+      console.warn('[TTS] 选中文本未在章节全文中找到，从头开始朗读');
+      this.engine.speak(content.text);
+      this.ui.chapterTitle = content.chapterTitle;
+      this.ui.totalChunks = this.engine.totalChunks;
+      this.ui.currentIndex = 0;
+      this.ui.playing = true;
+      return;
+    }
+
+    // 通过累积偏移找到对应的 chunk 索引
+    let chunkIndex = 0;
+    let offset = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      if (charIndex >= offset && charIndex < offset + chunks[i].length) {
+        chunkIndex = i;
+        break;
+      }
+      offset += chunks[i].length;
+    }
+
+    console.log(`[TTS] 从选区开始朗读: charIndex=${charIndex}, chunkIndex=${chunkIndex}`);
+    this.engine.speakFrom(chunkIndex, chunks);
+    this.ui.chapterTitle = content.chapterTitle;
+    this.ui.totalChunks = chunks.length;
+    this.ui.currentIndex = chunkIndex;
+    this.ui.playing = true;
+  }
+
+  /**
    * 从断点恢复播放
-   * 改进：不再从 localStorage 读取全文，而是重新从页面提取
    */
   private resumeFrom(state: NonNullable<ReturnType<typeof PlaybackStore.load>>): void {
-    // 使用当前已提取的文本（刚从页面提取的）
     const chunks = this.currentChunks.map((c) => c.text);
     this.engine.speakFrom(state.chunkIndex, chunks);
     this.ui.chapterTitle = state.chapterTitle;
@@ -216,12 +314,10 @@ export class TTSPlayer {
   private onAllEnd(): void {
     this.ui.playing = false;
     this.ui.currentIndex = 0;
-    // 清除断点
     if (this.bookId) PlaybackStore.clear(this.bookId);
   }
 
   private onEngineError(chunkIndex: number, error: string): void {
-    // 只对关键错误显示提示（跳过 canceled/interrupted 等正常中断）
     if (error === 'canceled' || error === 'interrupted') return;
     if (error.includes('中文语音') || error.includes('不支持')) {
       this.ui.showError(error);
@@ -238,7 +334,6 @@ export class TTSPlayer {
 
   private saveProgress(): void {
     if (!this.bookId || !this.currentContent) return;
-    // 传入 text 用于计算 hash，不再存储原文
     PlaybackStore.save({
       bookId: this.bookId,
       chapterTitle: this.currentContent.chapterTitle,
@@ -250,7 +345,6 @@ export class TTSPlayer {
   }
 
   private generateBookId(content: ExtractedContent): string {
-    // 使用 URL + 章节标题生成唯一 ID
     try {
       return `book_${location.hostname}_${btoa(content.chapterTitle).slice(0, 16)}`;
     } catch {
@@ -258,7 +352,7 @@ export class TTSPlayer {
     }
   }
 
-  /** 关闭播放器（公开方法，供外部调用） */
+  /** 关闭播放器 */
   close(): void {
     this.engine.cancel();
     this.ui.hide();
@@ -269,9 +363,6 @@ export class TTSPlayer {
 // ---- 启动入口 ----
 let playerInstance: TTSPlayer | null = null;
 
-/**
- * 初始化/获取 TTS 播放器实例（单例）
- */
 export function initTTS(): TTSPlayer {
   if (!playerInstance) {
     playerInstance = new TTSPlayer();
@@ -279,9 +370,6 @@ export function initTTS(): TTSPlayer {
   return playerInstance;
 }
 
-/**
- * 销毁 TTS 播放器
- */
 export function destroyTTS(): void {
   if (playerInstance) {
     playerInstance.close();

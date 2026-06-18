@@ -1,7 +1,7 @@
 /**
  * Web Speech API TTS 引擎封装
  * 支持：播放/暂停/恢复/停止、语速调节、音色选择、逐段朗读回调
- * 改进：增加可用性检测、错误回调、中文语音回退提示
+ * 改进：增加可用性检测、错误回调、中文语音回退提示、debug 日志
  */
 
 export interface TTSAvailability {
@@ -11,6 +11,10 @@ export interface TTSAvailability {
   allVoices: SpeechSynthesisVoice[]; // 所有语音
   message: string;          // 可读的状态描述
 }
+
+const DEBUG = true;
+function log(...args: any[]): void { if (DEBUG) console.log('[TTS Engine]', ...args); }
+function warn(...args: any[]): void { if (DEBUG) console.warn('[TTS Engine]', ...args); }
 
 export class WebTTSEngine {
   private utterance: SpeechSynthesisUtterance | null = null;
@@ -130,8 +134,7 @@ export class WebTTSEngine {
     // 检测中文语音
     const chineseVoices = WebTTSEngine.getChineseVoices();
     if (chineseVoices.length === 0 && !this._voice) {
-      console.warn('[TTS] 未检测到中文语音，将使用默认语音（可能无法正确朗读中文）');
-      // 不阻止播放，但通知上层
+      warn('未检测到中文语音，将使用默认语音（可能无法正确朗读中文）');
       this.onError?.(0, '未检测到中文语音，朗读效果可能不佳。建议安装中文语音包或切换云端 TTS。');
     }
 
@@ -140,11 +143,12 @@ export class WebTTSEngine {
     this.currentChunkIndex = 0;
     this._isPlaying = true;
     this._isPaused = false;
+    log('开始朗读，共', this.chunks.length, '段');
     this.speakCurrentChunk();
   }
 
   /**
-   * 从指定片段索引继续播放（用于断点续播）
+   * 从指定片段索引继续播放（用于断点续播 / 从选区开始）
    */
   speakFrom(chunkIndex: number, chunks: string[]): void {
     this.cancel();
@@ -152,6 +156,7 @@ export class WebTTSEngine {
     this.currentChunkIndex = chunkIndex;
     this._isPlaying = true;
     this._isPaused = false;
+    log('从第', chunkIndex, '段开始朗读，共', chunks.length, '段');
     this.speakCurrentChunk();
   }
 
@@ -160,6 +165,7 @@ export class WebTTSEngine {
     if (speechSynthesis.speaking && !speechSynthesis.paused) {
       speechSynthesis.pause();
       this._isPaused = true;
+      log('已暂停');
     }
   }
 
@@ -168,6 +174,7 @@ export class WebTTSEngine {
     if (speechSynthesis.paused) {
       speechSynthesis.resume();
       this._isPaused = false;
+      log('已恢复');
     }
   }
 
@@ -203,13 +210,13 @@ export class WebTTSEngine {
   private speakCurrentChunk(): void {
     if (this.currentChunkIndex >= this.chunks.length) {
       this._isPlaying = false;
+      log('全部片段朗读完毕');
       this.onAllEnd?.();
       return;
     }
 
     const text = this.chunks[this.currentChunkIndex];
     if (!text || !text.trim()) {
-      // 空片段直接跳过
       this.currentChunkIndex++;
       this.speakCurrentChunk();
       return;
@@ -217,23 +224,28 @@ export class WebTTSEngine {
 
     this.utterance = new SpeechSynthesisUtterance(text);
     this.utterance.rate = this._rate;
+    this.utterance.volume = 1; // 确保音量最大
     this.utterance.lang = 'zh-CN';
     if (this._voice) this.utterance.voice = this._voice;
 
+    log(`朗读第 ${this.currentChunkIndex + 1}/${this.chunks.length} 段: "${text.slice(0, 30)}..."`);
+
+    this.utterance.onstart = () => {
+      log(`第 ${this.currentChunkIndex} 段 onstart 触发`);
+    };
+
     this.utterance.onend = () => {
+      log(`第 ${this.currentChunkIndex} 段 onend 触发`);
       this.currentChunkIndex++;
       this.onChunkEnd?.(this.currentChunkIndex);
-      // 自动播放下一段
       if (this._isPlaying && !this._isPaused) {
         this.speakCurrentChunk();
       }
     };
 
     this.utterance.onerror = (event) => {
-      const errMsg = `片段 ${this.currentChunkIndex} 朗读错误: ${event.error}`;
-      console.warn('[TTS] ' + errMsg);
+      warn(`第 ${this.currentChunkIndex} 段 onerror: ${event.error}`);
       this.onError?.(this.currentChunkIndex, event.error);
-      // 非中断性错误（如 canceled）不跳过
       if (event.error !== 'canceled' && event.error !== 'interrupted') {
         this.currentChunkIndex++;
         if (this._isPlaying && !this._isPaused) {
@@ -250,9 +262,8 @@ export class WebTTSEngine {
    * 按句号、问号、感叹号、换行切分，每片不超过 maxChars 字符
    */
   private splitIntoChunks(text: string, maxChars = 300): string[] {
-    // 用 matchAll 保留分隔符的切分
     const pattern = /.*?[。！？\n]|.+$/gs;
-    const matches = [...text.matchAll(pattern)];
+    const matches = Array.from(text.matchAll(pattern));
     const chunks: string[] = [];
     let buffer = '';
 
@@ -262,7 +273,6 @@ export class WebTTSEngine {
       const trimmed = sentence.trim();
       if (!trimmed) continue;
 
-      // 超长无标点句强制按字符切分
       if (trimmed.length > maxChars) {
         if (buffer.trim()) { chunks.push(buffer.trim()); buffer = ''; }
         for (let i = 0; i < trimmed.length; i += maxChars) {

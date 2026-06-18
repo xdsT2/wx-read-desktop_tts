@@ -207,6 +207,27 @@ export const PLAYER_STYLES = `
   margin-left: 8px;
   font-weight: bold;
 }
+
+/* "从这里开始朗读" 选区浮动按钮 */
+#wx-read-tts-start-here {
+  position: fixed;
+  z-index: 2147483646;
+  background: #1aad63;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  cursor: pointer;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+  display: none;
+  user-select: none;
+  white-space: nowrap;
+  transition: opacity 0.2s, transform 0.2s;
+}
+#wx-read-tts-start-here:hover { background: #1bc06d; transform: scale(1.04); }
+#wx-read-tts-start-here:active { transform: scale(0.96); }
 `;
 
 // ---- HTML 模板 ----
@@ -277,11 +298,14 @@ export interface PlayerUICallbacks {
   onVoiceChange: (voiceName: string | null) => void;
   onClose: () => void;
   onExtractClick: () => void; // 手动触发提取+播放
+  onStartFromSelection?: (selectedText: string) => void; // 从选区开始朗读
 }
 
 export class PlayerUI {
   private container: HTMLElement;
   private settingsPanel: HTMLElement;
+  private startHereBtn: HTMLElement;
+  private callbacks: PlayerUICallbacks;
 
   /** 当前章节标题 */
   set chapterTitle(v: string) {
@@ -380,6 +404,8 @@ export class PlayerUI {
   }
 
   constructor(callbacks: PlayerUICallbacks) {
+    this.callbacks = callbacks;
+
     // 注入样式
     const styleEl = document.createElement('style');
     styleEl.textContent = PLAYER_STYLES;
@@ -392,6 +418,12 @@ export class PlayerUI {
 
     this.container = document.getElementById('wx-read-tts-player')!;
     this.settingsPanel = document.getElementById('wx-read-tts-settings')!;
+
+    // 创建"从这里开始朗读"浮动按钮
+    this.startHereBtn = document.createElement('button');
+    this.startHereBtn.id = 'wx-read-tts-start-here';
+    this.startHereBtn.textContent = '从这里开始朗读';
+    document.body.appendChild(this.startHereBtn);
 
     // 绑定事件
     this.bindEvents(callbacks);
@@ -439,5 +471,37 @@ export class PlayerUI {
 
     // 错误条关闭按钮
     this.container.querySelector('.tts-error-close')?.addEventListener('click', () => this.hideError());
+
+    // "从这里开始朗读" 按钮点击
+    this.startHereBtn.addEventListener('click', () => {
+      const sel = window.getSelection();
+      const selText = sel ? sel.toString().trim() : '';
+      if (selText && cb.onStartFromSelection) {
+        cb.onStartFromSelection(selText);
+      }
+      this.startHereBtn.style.display = 'none';
+    });
+
+    // 选区变化时显示/隐藏 startHere 按钮
+    document.addEventListener('selectionchange', () => {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || !sel.toString().trim()) {
+        this.startHereBtn.style.display = 'none';
+        return;
+      }
+      try {
+        const range = sel.getRangeAt(0);
+        const rect = range.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) {
+          this.startHereBtn.style.display = 'none';
+          return;
+        }
+        this.startHereBtn.style.display = 'block';
+        this.startHereBtn.style.top = (rect.top + window.scrollY - 36) + 'px';
+        this.startHereBtn.style.left = (rect.left + window.scrollX + rect.width / 2 - 60) + 'px';
+      } catch {
+        this.startHereBtn.style.display = 'none';
+      }
+    });
   }
 }
