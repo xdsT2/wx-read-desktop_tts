@@ -66,8 +66,9 @@ export class TextExtractor {
 
   /**
    * 清理提取的文本（去除多余空白、特殊字符）
+   * 公开方法，供 selectionchange 和 startFromSelection 使用
    */
-  private static cleanText(raw: string): string {
+  static cleanText(raw: string): string {
     return raw
       .replace(/\s+/g, ' ')
       .replace(/[^\u4e00-\u9fa5a-zA-Z0-9，。！？、；：""''（）\n\r\s\.\,\!\?\;\:\(\)\-\—]/g, '')
@@ -174,7 +175,7 @@ export class TextExtractor {
       }
     }
 
-    return bestEl || document.body;
+    return bestEl || null;
   }
 
   /**

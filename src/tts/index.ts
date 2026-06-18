@@ -224,9 +224,9 @@ export class TTSPlayer {
 
   /**
    * 从选中文本位置开始朗读
-   * 优先使用 Range API 精确计算选区在正文容器内的字符偏移，
-   * 比 indexOf 更可靠（正确处理 DOM text node 分割、空格差异等）
-   * 若选区不在正文容器内，退回用文本模糊匹配
+   * 优先用 cleanText(选区) 在 cleanText(全文) 中定位（两边规范化一致），
+   * 备用：Range preRange → cleanText → lastIndexOf 定位
+   * 定位失败时提示用户，不静默回退
    */
   startFromSelection(selectedText: string): void {
     if (!selectedText) return;
@@ -242,29 +242,47 @@ export class TTSPlayer {
     this.bookId = this.generateBookId(content);
     const chunks = this.currentChunks.map((c) => c.text);
 
-    // 1. 优先用 Range API 精确计算选区在正文容器内的字符偏移
-    const contentEl = TextExtractor.findContentElement();
-    const domOffset = TextExtractor.getSelectionOffsetInContainer(contentEl);
-
+    // 1. 优先通过 cleaned selection 在 cleaned fullText 中定位
+    const cleanedSel = TextExtractor.cleanText(selectedText);
     let charIndex = -1;
-    if (domOffset >= 0) {
-      // 选区在正文容器内，直接用 DOM 偏移
-      charIndex = domOffset;
-      console.log(`[TTS] Range API 定位: domOffset=${domOffset}`);
-    } else {
-      // 2. 选区不在正文容器内，退回用文本模糊匹配
-      const fullText = content.text;
-      charIndex = fullText.indexOf(selectedText);
-      if (charIndex === -1 && selectedText.length > 10) {
-        const prefix = selectedText.slice(0, Math.min(60, selectedText.length));
-        charIndex = fullText.indexOf(prefix);
-      }
+    if (cleanedSel && cleanedSel.length >= 3) {
+      charIndex = content.text.indexOf(cleanedSel);
       if (charIndex >= 0) {
-        console.log(`[TTS] 文本模糊匹配定位: charIndex=${charIndex}`);
+        console.log(`[TTS] cleaned match at ${charIndex}`);
       }
     }
 
-    // 3. 仍找不到，提示用户（不静默回退到从头开始）
+    // 2. 备用：若 cleaned 匹配失败，尝试用 Range -> preRange -> clean -> lastIndexOf
+    if (charIndex === -1) {
+      const contentEl = TextExtractor.findContentElement();
+      if (contentEl) {
+        const domOffset = TextExtractor.getSelectionOffsetInContainer(contentEl);
+        if (domOffset >= 0) {
+          // 用 preRange 获取选区前的文本，clean 后在 fullText 中定位
+          try {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0) {
+              const range = sel.getRangeAt(0);
+              const preRange = document.createRange();
+              preRange.selectNodeContents(contentEl);
+              preRange.setEnd(range.startContainer, range.startOffset);
+              const preText = preRange.toString();
+              // 取最后 200 字符上下文做 lastIndexOf
+              const cleanedPre = TextExtractor.cleanText(preText.slice(-200));
+              if (cleanedPre) {
+                const idx = content.text.lastIndexOf(cleanedPre);
+                if (idx !== -1) {
+                  charIndex = idx + Math.max(0, cleanedPre.length - 1);
+                  console.log(`[TTS] Range+clean fallback at ${charIndex}`);
+                }
+              }
+            }
+          } catch { /* ignore */ }
+        }
+      }
+    }
+
+    // 3. 定位失败，提示用户
     if (charIndex === -1) {
       console.warn('[TTS] 无法精确定位选区在正文中的偏移');
       this.ui.showError('无法精确定位选区位置，请在正文内选中文本或选取更多内容。');

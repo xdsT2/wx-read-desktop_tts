@@ -231,7 +231,7 @@
         var chineseCount = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
         if (chineseCount > maxLength && chineseCount > 50) { maxLength = chineseCount; bestEl = el2; }
       }
-      return bestEl || document.body;
+      return bestEl || null;
     },
     /** 计算当前选区在指定容器内的字符偏移（Range API），返回 -1 表示选区不在容器内 */
     getSelectionOffsetInContainer: function (container) {
@@ -418,13 +418,37 @@
       self.startHereBtn.style.display = 'none';
     });
 
-    // 选区变化时显示/隐藏 startHere 按钮（只在正文容器内才显示）
+    // 选区变化时显示/隐藏 startHere 按钮（只在正文容器内且 cleaned 匹配成功时才显示）
     document.addEventListener('selectionchange', function () {
       var sel = window.getSelection();
       if (!sel || sel.isCollapsed || !sel.toString().trim()) {
         self.startHereBtn.style.display = 'none';
         return;
       }
+
+      // 找正文容器（可能为 null）
+      var contentEl = TextExtractor.findContentElement();
+      if (!contentEl) {
+        self.startHereBtn.style.display = 'none';
+        return;
+      }
+
+      // 清洗选区文本并在 fullText 中快速匹配
+      var rawSelText = sel.toString().trim();
+      var cleanedSel = TextExtractor.cleanText(rawSelText);
+      if (!cleanedSel || cleanedSel.length < 3) {
+        self.startHereBtn.style.display = 'none';
+        return;
+      }
+
+      // 提取正文并尝试匹配
+      var content = TextExtractor.extract();
+      if (!content || content.text.indexOf(cleanedSel) === -1) {
+        self.startHereBtn.style.display = 'none';
+        return;
+      }
+
+      // 匹配成功，定位按钮
       try {
         var range = sel.getRangeAt(0);
         var rect = range.getBoundingClientRect();
@@ -432,13 +456,6 @@
           self.startHereBtn.style.display = 'none';
           return;
         }
-        // 只在选区位于正文容器内时才显示按钮
-        var contentEl = TextExtractor.findContentElement();
-        if (!contentEl || (!contentEl.contains(range.startContainer) && !contentEl.contains(range.endContainer))) {
-          self.startHereBtn.style.display = 'none';
-          return;
-        }
-        // 定位按钮到选区右上角
         var top = rect.top + window.scrollY - 36;
         var left = rect.right + window.scrollX - 80;
         self.startHereBtn.style.top = (top > 10 ? top : rect.bottom + window.scrollY + 8) + 'px';
@@ -574,7 +591,7 @@
     this.startNew(content);
   };
 
-  /** 从选中文本位置开始朗读（Range API 精确定位 + 模糊匹配兜底） */
+  /** 从选中文本位置开始朗读（cleaned selection 优先 + Range+clean 备用） */
   TTSPlayer.prototype.startFromSelection = function (selectedText) {
     if (!selectedText) return;
     var content = TextExtractor.extract();
@@ -584,28 +601,44 @@
     this.currentChunks = this.chunkText(content.text);
     this.bookId = this.makeBookId(content);
 
-    // 1. 优先用 Range API 精确计算选区在正文容器内的字符偏移
-    var contentEl = TextExtractor.findContentElement();
-    var domOffset = TextExtractor.getSelectionOffsetInContainer(contentEl);
-
+    // 1. 优先通过 cleaned selection 在 cleaned fullText 中定位
+    var cleanedSel = TextExtractor.cleanText(selectedText);
     var charIndex = -1;
-    if (domOffset >= 0) {
-      charIndex = domOffset;
-      console.log('[TTS] Range API 定位: domOffset=' + domOffset);
-    } else {
-      // 2. 选区不在正文容器内，退回用文本模糊匹配
-      var fullText = content.text;
-      charIndex = fullText.indexOf(selectedText);
-      if (charIndex === -1 && selectedText.length > 10) {
-        var prefix = selectedText.slice(0, Math.min(60, selectedText.length));
-        charIndex = fullText.indexOf(prefix);
-      }
+    if (cleanedSel && cleanedSel.length >= 3) {
+      charIndex = content.text.indexOf(cleanedSel);
       if (charIndex >= 0) {
-        console.log('[TTS] 文本模糊匹配定位: charIndex=' + charIndex);
+        console.log('[TTS] cleaned match at ' + charIndex);
       }
     }
 
-    // 3. 仍找不到，提示用户（不静默回退到从头开始）
+    // 2. 备用：若 cleaned 匹配失败，尝试用 Range -> preRange -> clean -> lastIndexOf
+    if (charIndex === -1) {
+      var contentEl = TextExtractor.findContentElement();
+      if (contentEl) {
+        try {
+          var sel = window.getSelection();
+          if (sel && sel.rangeCount > 0) {
+            var range = sel.getRangeAt(0);
+            if (contentEl.contains(range.startContainer)) {
+              var preRange = document.createRange();
+              preRange.selectNodeContents(contentEl);
+              preRange.setEnd(range.startContainer, range.startOffset);
+              var preText = preRange.toString();
+              var cleanedPre = TextExtractor.cleanText(preText.slice(-200));
+              if (cleanedPre) {
+                var idx = content.text.lastIndexOf(cleanedPre);
+                if (idx !== -1) {
+                  charIndex = idx + Math.max(0, cleanedPre.length - 1);
+                  console.log('[TTS] Range+clean fallback at ' + charIndex);
+                }
+              }
+            }
+          }
+        } catch (e) { /* ignore */ }
+      }
+    }
+
+    // 3. 仍找不到，提示用户（不静默回退）
     if (charIndex === -1) {
       console.warn('[TTS] 无法精确定位选区在正文中的偏移');
       alert('无法精确定位选区在正文中的位置，请在正文内选中文本或尝试稍微选取更多内容。');
